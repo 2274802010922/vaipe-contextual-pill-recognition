@@ -19,9 +19,6 @@ from tqdm import tqdm
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
-# =========================
-# Config
-# =========================
 DATA_DIR = "/content/processed_pill_cls"
 IMAGE_SIZE = 224
 BATCH_SIZE = 32
@@ -34,9 +31,6 @@ MODEL_NAME = "tf_efficientnetv2_s.in21k_ft_in1k"
 OUTPUT_DIR = "./outputs"
 
 
-# =========================
-# Utils
-# =========================
 def seed_everything(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -52,20 +46,24 @@ def get_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# =========================
-# Dataset
-# =========================
 def build_file_list(data_dir):
     data_dir = Path(data_dir)
     class_dirs = sorted([d for d in data_dir.iterdir() if d.is_dir()], key=lambda x: int(x.name))
 
     samples = []
     class_names = []
+    class_to_idx = {}
+
+    for idx, class_dir in enumerate(class_dirs):
+        original_class_id = int(class_dir.name)
+        class_names.append(str(original_class_id))
+        class_to_idx[original_class_id] = idx
+
     for class_dir in class_dirs:
-        class_id = int(class_dir.name)
-        class_names.append(str(class_id))
+        original_class_id = int(class_dir.name)
+        mapped_label = class_to_idx[original_class_id]
         for img_path in class_dir.glob("*.jpg"):
-            samples.append((str(img_path), class_id))
+            samples.append((str(img_path), mapped_label))
 
     return samples, class_names
 
@@ -106,9 +104,6 @@ def build_transforms(image_size=224):
     return train_tfms, val_tfms
 
 
-# =========================
-# Train / Val
-# =========================
 def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
     running_loss = 0.0
@@ -165,9 +160,6 @@ def validate_one_epoch(model, loader, criterion, device):
     return epoch_loss, epoch_acc, epoch_f1, all_labels, all_preds
 
 
-# =========================
-# Main
-# =========================
 def main():
     seed_everything(SEED)
     ensure_dir(OUTPUT_DIR)
@@ -179,6 +171,14 @@ def main():
     print("Total classes:", len(class_names))
 
     labels = [label for _, label in samples]
+
+    label_counts = Counter(labels)
+    valid_labels = {label for label, count in label_counts.items() if count >= 2}
+    samples = [(path, label) for path, label in samples if label in valid_labels]
+    labels = [label for _, label in samples]
+
+    print("Samples after filtering rare classes:", len(samples))
+    print("Usable classes:", len(set(labels)))
 
     train_samples, val_samples = train_test_split(
         samples,
@@ -210,7 +210,7 @@ def main():
         pin_memory=True
     )
 
-    num_classes = len(class_names)
+    num_classes = len(set(labels))
     model = timm.create_model(
         MODEL_NAME,
         pretrained=True,
@@ -231,6 +231,7 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
     best_f1 = 0.0
+    best_labels, best_preds = None, None
 
     for epoch in range(EPOCHS):
         print(f"\nEpoch [{epoch+1}/{EPOCHS}]")
@@ -248,13 +249,15 @@ def main():
 
         if val_f1 > best_f1:
             best_f1 = val_f1
+            best_labels, best_preds = val_labels, val_preds
             torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "best_model.pth"))
             print(f"Saved best model with Val Macro F1 = {best_f1:.4f}")
 
     print("\nBest Val Macro F1:", round(best_f1, 4))
 
-    print("\nClassification report on validation set:")
-    print(classification_report(val_labels, val_preds, digits=4, zero_division=0))
+    if best_labels is not None and best_preds is not None:
+        print("\nClassification report on best validation set:")
+        print(classification_report(best_labels, best_preds, digits=4, zero_division=0))
 
 
 if __name__ == "__main__":

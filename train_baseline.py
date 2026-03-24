@@ -170,22 +170,30 @@ def main():
     print("Total cropped samples:", len(samples))
     print("Total classes:", len(class_names))
 
-    labels = [label for _, label in samples]
+labels = [label for _, label in samples]
 
-    label_counts = Counter(labels)
-    valid_labels = {label for label, count in label_counts.items() if count >= 2}
-    samples = [(path, label) for path, label in samples if label in valid_labels]
-    labels = [label for _, label in samples]
+label_counts = Counter(labels)
+valid_labels = sorted([label for label, count in label_counts.items() if count >= 2])
 
-    print("Samples after filtering rare classes:", len(samples))
-    print("Usable classes:", len(set(labels)))
+samples = [(path, label) for path, label in samples if label in set(valid_labels)]
 
-    train_samples, val_samples = train_test_split(
-        samples,
-        test_size=0.2,
-        random_state=SEED,
-        stratify=labels
-    )
+# Remap labels to contiguous range: 0..num_classes-1
+old_to_new = {old_label: new_label for new_label, old_label in enumerate(valid_labels)}
+samples = [(path, old_to_new[label]) for path, label in samples]
+
+labels = [label for _, label in samples]
+
+print("Samples after filtering rare classes:", len(samples))
+print("Usable classes:", len(set(labels)))
+print("Min label after remap:", min(labels))
+print("Max label after remap:", max(labels))
+
+train_samples, val_samples = train_test_split(
+    samples,
+    test_size=0.2,
+    random_state=SEED,
+    stratify=labels
+)
 
     print("Train samples:", len(train_samples))
     print("Val samples:", len(val_samples))

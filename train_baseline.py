@@ -48,7 +48,10 @@ def get_device():
 
 def build_file_list(data_dir):
     data_dir = Path(data_dir)
-    class_dirs = sorted([d for d in data_dir.iterdir() if d.is_dir()], key=lambda x: int(x.name))
+    class_dirs = sorted(
+        [d for d in data_dir.iterdir() if d.is_dir()],
+        key=lambda x: int(x.name)
+    )
 
     samples = []
     class_names = []
@@ -91,16 +94,21 @@ def build_transforms(image_size=224):
         transforms.RandomRotation(10),
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        ),
     ])
 
     val_tfms = transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        ),
     ])
+
     return train_tfms, val_tfms
 
 
@@ -163,6 +171,7 @@ def validate_one_epoch(model, loader, criterion, device):
 def main():
     seed_everything(SEED)
     ensure_dir(OUTPUT_DIR)
+
     device = get_device()
     print("Using device:", device)
 
@@ -170,30 +179,30 @@ def main():
     print("Total cropped samples:", len(samples))
     print("Total classes:", len(class_names))
 
-labels = [label for _, label in samples]
+    labels = [label for _, label in samples]
 
-label_counts = Counter(labels)
-valid_labels = sorted([label for label, count in label_counts.items() if count >= 2])
+    label_counts = Counter(labels)
+    valid_labels = sorted([label for label, count in label_counts.items() if count >= 2])
 
-samples = [(path, label) for path, label in samples if label in set(valid_labels)]
+    samples = [(path, label) for path, label in samples if label in set(valid_labels)]
 
-# Remap labels to contiguous range: 0..num_classes-1
-old_to_new = {old_label: new_label for new_label, old_label in enumerate(valid_labels)}
-samples = [(path, old_to_new[label]) for path, label in samples]
+    # Remap labels to contiguous range: 0..num_classes-1
+    old_to_new = {old_label: new_label for new_label, old_label in enumerate(valid_labels)}
+    samples = [(path, old_to_new[label]) for path, label in samples]
 
-labels = [label for _, label in samples]
+    labels = [label for _, label in samples]
 
-print("Samples after filtering rare classes:", len(samples))
-print("Usable classes:", len(set(labels)))
-print("Min label after remap:", min(labels))
-print("Max label after remap:", max(labels))
+    print("Samples after filtering rare classes:", len(samples))
+    print("Usable classes:", len(set(labels)))
+    print("Min label after remap:", min(labels))
+    print("Max label after remap:", max(labels))
 
-train_samples, val_samples = train_test_split(
-    samples,
-    test_size=0.2,
-    random_state=SEED,
-    stratify=labels
-)
+    train_samples, val_samples = train_test_split(
+        samples,
+        test_size=0.2,
+        random_state=SEED,
+        stratify=labels
+    )
 
     print("Train samples:", len(train_samples))
     print("Val samples:", len(val_samples))
@@ -227,6 +236,7 @@ train_samples, val_samples = train_test_split(
 
     train_label_counts = Counter([label for _, label in train_samples])
     class_weights = []
+
     for class_id in range(num_classes):
         count = train_label_counts.get(class_id, 1)
         class_weights.append(1.0 / count)
@@ -236,7 +246,11 @@ train_samples, val_samples = train_test_split(
     class_weights = class_weights.to(device)
 
     criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LR,
+        weight_decay=WEIGHT_DECAY
+    )
 
     best_f1 = 0.0
     best_labels, best_preds = None, None
@@ -252,8 +266,16 @@ train_samples, val_samples = train_test_split(
             model, val_loader, criterion, device
         )
 
-        print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Train Macro F1: {train_f1:.4f}")
-        print(f"Val   Loss: {val_loss:.4f} | Val   Acc: {val_acc:.4f} | Val   Macro F1: {val_f1:.4f}")
+        print(
+            f"Train Loss: {train_loss:.4f} | "
+            f"Train Acc: {train_acc:.4f} | "
+            f"Train Macro F1: {train_f1:.4f}"
+        )
+        print(
+            f"Val   Loss: {val_loss:.4f} | "
+            f"Val   Acc: {val_acc:.4f} | "
+            f"Val   Macro F1: {val_f1:.4f}"
+        )
 
         if val_f1 > best_f1:
             best_f1 = val_f1

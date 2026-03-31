@@ -172,7 +172,6 @@ class BestPIKAModel(nn.Module):
             num_classes=0,
             global_pool="avg"
         )
-
         self.pres_encoder = timm.create_model(
             pres_model_name,
             pretrained=True,
@@ -208,14 +207,14 @@ class BestPIKAModel(nn.Module):
         self.classifier = nn.Linear(256, num_classes)
 
     def forward(self, pill_img, pres_img, context_indices, context_mask):
-        pill_feat = self.pill_proj(self.pill_encoder(pill_img))   # [B, H]
-        pres_feat = self.pres_proj(self.pres_encoder(pres_img))   # [B, H]
+        pill_feat = self.pill_proj(self.pill_encoder(pill_img))
+        pres_feat = self.pres_proj(self.pres_encoder(pres_img))
 
-        graph_nodes = self.graph_encoder(self.adj_matrix)         # [C, H]
+        graph_nodes = self.graph_encoder(self.adj_matrix)
 
         safe_indices = context_indices.clone()
         safe_indices[safe_indices < 0] = 0
-        context_emb = graph_nodes[safe_indices]                   # [B, L, H]
+        context_emb = graph_nodes[safe_indices]
 
         scores = (context_emb * pill_feat.unsqueeze(1)).sum(dim=-1) / math.sqrt(context_emb.size(-1))
         scores = scores.masked_fill(~context_mask, -1e9)
@@ -225,7 +224,7 @@ class BestPIKAModel(nn.Module):
         if has_context.any():
             attn_weights[has_context] = torch.softmax(scores[has_context], dim=1)
 
-        graph_ctx = (attn_weights.unsqueeze(-1) * context_emb).sum(dim=1)  # [B, H]
+        graph_ctx = (attn_weights.unsqueeze(-1) * context_emb).sum(dim=1)
 
         gate_input = torch.cat([pill_feat, pres_feat, graph_ctx], dim=1)
         gates = self.gate(gate_input)
@@ -263,7 +262,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
 
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.cuda.amp.autocast(enabled=(device == "cuda")):
+        with torch.amp.autocast("cuda", enabled=(device == "cuda")):
             outputs = model(pill_imgs, pres_imgs, context_indices, context_mask)
             loss = criterion(outputs, labels)
 
@@ -298,7 +297,7 @@ def validate_one_epoch(model, loader, criterion, device):
         context_mask = context_mask.to(device)
         labels = labels.to(device)
 
-        with torch.cuda.amp.autocast(enabled=(device == "cuda")):
+        with torch.amp.autocast("cuda", enabled=(device == "cuda")):
             outputs = model(pill_imgs, pres_imgs, context_indices, context_mask)
             loss = criterion(outputs, labels)
 
@@ -422,7 +421,7 @@ def main():
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
 
     best_f1 = 0.0
     best_labels, best_preds = None, None

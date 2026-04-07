@@ -60,8 +60,8 @@ Bài báo công bố kết quả tốt nhất đạt F1 bằng 0.8571 với back
 
 This project uses the VAIPE dataset.
 
-Dự án sử dụng bộ dữ liệu VAIPE.
-
+Dự án sử dụng bộ dữ liệu VAIPE. ( link dataset : https://www.kaggle.com/datasets/tommyngx/vaipepill2022 )
+ 
 Dataset related link:
 Liên kết liên quan đến dữ liệu:
 

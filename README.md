@@ -297,14 +297,4 @@ Tóm lại, project này kế thừa tư tưởng cốt lõi của bài báo PIK
 
 Chính các khác biệt đó đã tạo nền tảng để mô hình cuối cùng không chỉ bám sát tinh thần của bài báo tham chiếu mà còn đạt kết quả thực nghiệm cao hơn.
 
-## 9. Điểm nổi bật của v3 so với v2
 
-So với phiên bản v2, phiên bản v3 có các điểm nổi bật sau:
-
-- bổ sung **resume training**
-- tự động lưu **resume checkpoint sau mỗi epoch**
-- có thể tiếp tục huấn luyện nếu Google Colab bị ngắt
-- giúp quá trình fine-tune ổn định và an toàn hơn
-- tiếp tục cải thiện kết quả từ **0.8936** lên **0.9011**
-
----

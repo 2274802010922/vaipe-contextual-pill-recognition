@@ -3,12 +3,14 @@ import glob
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
-from PIL import Image
+from PIL import Image, ImageFile
 
 import torch
 from torch.utils.data import Dataset
 from torchvision.transforms import functional as F
 
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 IMG_EXTENSIONS = ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.webp")
 
@@ -58,7 +60,6 @@ def parse_bbox_from_annotation(ann: Dict[str, Any]) -> Optional[Tuple[float, flo
     - {"x1": ..., "y1": ..., "x2": ..., "y2": ...}
     """
     try:
-        # Format chính: x, y, w, h
         if all(k in ann for k in ["x", "y", "w", "h"]):
             x = float(ann["x"])
             y = float(ann["y"])
@@ -66,7 +67,6 @@ def parse_bbox_from_annotation(ann: Dict[str, Any]) -> Optional[Tuple[float, flo
             h = float(ann["h"])
             return x, y, x + w, y + h
 
-        # Dự phòng: bbox
         if "bbox" in ann and isinstance(ann["bbox"], (list, tuple)) and len(ann["bbox"]) == 4:
             a, b, c, d = ann["bbox"]
             a = float(a)
@@ -74,15 +74,11 @@ def parse_bbox_from_annotation(ann: Dict[str, Any]) -> Optional[Tuple[float, flo
             c = float(c)
             d = float(d)
 
-            # Nếu có vẻ là [x, y, w, h]
             if c > 0 and d > 0 and (c < 5000 and d < 5000):
-                # Ta không thể chắc 100% là wh hay x2y2, nên ưu tiên cách phổ biến hơn: xywh
-                # Nhưng nếu c <= a hoặc d <= b thì hiểu là x2y2
                 if c <= a or d <= b:
                     return a, b, c, d
                 return a, b, a + c, b + d
 
-        # Dự phòng: x1,y1,x2,y2
         if all(k in ann for k in ["x1", "y1", "x2", "y2"]):
             return (
                 float(ann["x1"]),
@@ -100,7 +96,7 @@ def parse_bbox_from_annotation(ann: Dict[str, Any]) -> Optional[Tuple[float, flo
 def clamp_box(
     box: Tuple[float, float, float, float],
     width: int,
-    height: int
+    height: int,
 ) -> Optional[Tuple[float, float, float, float]]:
     x1, y1, x2, y2 = box
 
@@ -120,12 +116,12 @@ class VaipeDetectionDataset(Dataset):
     Dataset để train Faster R-CNN trên public_train.
 
     Kỳ vọng cấu trúc:
-        root_dir/
-            pill/
-                image/
-                    xxx.jpg
-                label/
-                    xxx.json
+    root_dir/
+        pill/
+            image/
+                xxx.jpg
+            label/
+                xxx.json
 
     Output:
         image: Tensor [C,H,W]
@@ -161,7 +157,9 @@ class VaipeDetectionDataset(Dataset):
     def __getitem__(self, index: int):
         image_path, json_path = self.samples[index]
 
-        image = Image.open(image_path).convert("RGB")
+        with Image.open(image_path) as img:
+            image = img.convert("RGB")
+
         width, height = image.size
 
         raw_data = load_json(json_path)
@@ -183,7 +181,6 @@ class VaipeDetectionDataset(Dataset):
             x1, y1, x2, y2 = clamped
             boxes_list.append([x1, y1, x2, y2])
 
-            # Detector chỉ có 1 class foreground là "pill"
             labels_list.append(1)
             area_list.append((x2 - x1) * (y2 - y1))
 
@@ -213,10 +210,10 @@ class VaipeDetectionInferenceDataset(Dataset):
     Dataset chỉ dùng để suy luận detector trên public_test.
 
     Kỳ vọng cấu trúc:
-        root_dir/
-            pill/
-                image/
-                    *.jpg / *.png ...
+    root_dir/
+        pill/
+            image/
+                *.jpg / *.png ...
 
     Output:
         image_tensor, image_path
@@ -230,7 +227,6 @@ class VaipeDetectionInferenceDataset(Dataset):
             raise FileNotFoundError(f"Không tìm thấy thư mục image: {self.image_dir}")
 
         self.image_paths = list_images(self.image_dir)
-
         if len(self.image_paths) == 0:
             raise RuntimeError(f"Không tìm thấy ảnh nào trong {self.image_dir}")
 
@@ -239,7 +235,10 @@ class VaipeDetectionInferenceDataset(Dataset):
 
     def __getitem__(self, index: int):
         image_path = self.image_paths[index]
-        image = Image.open(image_path).convert("RGB")
+
+        with Image.open(image_path) as img:
+            image = img.convert("RGB")
+
         image_tensor = F.to_tensor(image)
         return image_tensor, image_path
 

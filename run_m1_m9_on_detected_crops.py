@@ -77,11 +77,24 @@ def find_first_existing(paths: List[str]) -> Optional[str]:
     return None
 
 
+def dedupe_keep_order(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for item in items:
+        if not item:
+            continue
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
 def guess_artifact_dirs(model_key: str, artifact_root: Optional[str]) -> List[str]:
     dirs = []
 
     if artifact_root:
-        mapping = {
+        primary_mapping = {
             "M1": "M1_baseline",
             "M2": "M2_pika_like_v1",
             "M3": "M3_pika_v2",
@@ -92,15 +105,24 @@ def guess_artifact_dirs(model_key: str, artifact_root: Optional[str]) -> List[st
             "M8": "M8_finetune_v2",
             "M9": "M9_finetune_v3",
         }
-        dirs.append(os.path.join(artifact_root, mapping[model_key]))
+        alias_mapping = {
+            "M5": ["M5_pika_graph", "processed_pika_graph", "M6_best_pika_pre_ft"],
+            "M6": ["processed_pika_best"],
+            "M7": ["M6_best_pika_pre_ft", "processed_pika_best"],
+            "M8": ["M6_best_pika_pre_ft", "processed_pika_best"],
+            "M9": ["M6_best_pika_pre_ft", "processed_pika_best"],
+        }
 
-    # Fallback theo processed root bạn từng dùng trong Colab
+        dirs.append(os.path.join(artifact_root, primary_mapping[model_key]))
+        for alias in alias_mapping.get(model_key, []):
+            dirs.append(os.path.join(artifact_root, alias))
+
     fallback = {
         "M1": [],
         "M2": ["/content/processed_pika"],
         "M3": ["/content/processed_pika_v2"],
         "M4": ["/content/processed_pika_v3"],
-        "M5": ["/content/processed_pika_graph"],
+        "M5": ["/content/processed_pika_graph", "/content/processed_pika_best"],
         "M6": ["/content/processed_pika_best"],
         "M7": ["/content/processed_pika_best"],
         "M8": ["/content/processed_pika_best"],
@@ -108,7 +130,7 @@ def guess_artifact_dirs(model_key: str, artifact_root: Optional[str]) -> List[st
     }
     dirs.extend(fallback[model_key])
 
-    return dirs
+    return dedupe_keep_order(dirs)
 
 
 def build_idx_to_label_map_from_csv(csv_path: str) -> Optional[Dict[int, str]]:
@@ -285,9 +307,62 @@ def build_model_from_spec(model_key: str, checkpoint_path: str, artifact_root: O
 
 
 def normalize_map_key(name: str) -> List[str]:
+    name = str(name)
     base = os.path.basename(name)
     stem = os.path.splitext(base)[0]
-    return [name, base, stem]
+    keys = [name, base, stem]
+
+    if "_det_" in stem:
+        original_stem = stem.split("_det_")[0]
+        keys.append(original_stem)
+        keys.append(original_stem + ".jpg")
+        keys.append(original_stem + ".png")
+
+    return dedupe_keep_order(keys)
+
+
+def extract_row_identifier_candidates(row: pd.Series) -> List[str]:
+    candidates = []
+
+    for col in ["image_name", "crop_name", "image_path", "crop_path"]:
+        if col in row and pd.notna(row[col]):
+            value = str(row[col]).strip()
+            if value:
+                candidates.append(value)
+                candidates.append(os.path.basename(value))
+
+    return dedupe_keep_order(candidates)
+
+
+def lookup_prescription_name_for_row(row: pd.Series, pill_to_pres: Dict[str, str]) -> Optional[str]:
+    for candidate in extract_row_identifier_candidates(row):
+        for key in normalize_map_key(candidate):
+            pres_name = pill_to_pres.get(key)
+            if pres_name:
+                return str(pres_name)
+    return None
+
+
+def build_prescription_file_index(test_root: str) -> Dict[str, str]:
+    candidate_dirs = [
+        os.path.join(test_root, "prescription", "image"),
+        os.path.join(test_root, "prescription"),
+        os.path.join(test_root, "pres", "image"),
+        os.path.join(test_root, "pres"),
+    ]
+
+    index = {}
+    for root_dir in candidate_dirs:
+        if not os.path.isdir(root_dir):
+            continue
+        for fn in os.listdir(root_dir):
+            full_path = os.path.join(root_dir, fn)
+            if not os.path.isfile(full_path):
+                continue
+            for key in normalize_map_key(fn):
+                index[key] = full_path
+
+    return index
 
 
 def build_pill_to_prescription_map(test_root: str) -> Dict[str, str]:
@@ -307,12 +382,16 @@ def build_pill_to_prescription_map(test_root: str) -> Dict[str, str]:
     def add_entry(pill_name, pres_name):
         if pill_name is None or pres_name is None:
             return
-        pill_keys = normalize_map_key(str(pill_name))
-        for k in pill_keys:
-            mapping[k] = str(pres_name)
+
+        if isinstance(pill_name, (list, tuple, set)):
+            for item in pill_name:
+                add_entry(item, pres_name)
+            return
+
+        for key in normalize_map_key(str(pill_name)):
+            mapping[key] = str(pres_name)
 
     if isinstance(data, dict):
-        # Trường hợp đơn giản: {pill_image: prescription_image}
         simple = True
         for k, v in data.items():
             if isinstance(v, str):
@@ -322,20 +401,22 @@ def build_pill_to_prescription_map(test_root: str) -> Dict[str, str]:
 
         if not simple:
             for _, item in data.items():
-                if isinstance(item, dict):
-                    pill_name = (
-                        item.get("pill")
-                        or item.get("pill_image")
-                        or item.get("pill_image_name")
-                        or item.get("pill_name")
-                    )
-                    pres_name = (
-                        item.get("prescription")
-                        or item.get("prescription_image")
-                        or item.get("prescription_image_name")
-                        or item.get("pres_name")
-                    )
-                    add_entry(pill_name, pres_name)
+                if not isinstance(item, dict):
+                    continue
+                pill_name = (
+                    item.get("pill")
+                    or item.get("pill_image")
+                    or item.get("pill_image_name")
+                    or item.get("pill_name")
+                )
+                pres_name = (
+                    item.get("pres")
+                    or item.get("prescription")
+                    or item.get("prescription_image")
+                    or item.get("prescription_image_name")
+                    or item.get("pres_name")
+                )
+                add_entry(pill_name, pres_name)
 
     elif isinstance(data, list):
         for item in data:
@@ -348,7 +429,8 @@ def build_pill_to_prescription_map(test_root: str) -> Dict[str, str]:
                 or item.get("pill_name")
             )
             pres_name = (
-                item.get("prescription")
+                item.get("pres")
+                or item.get("prescription")
                 or item.get("prescription_image")
                 or item.get("prescription_image_name")
                 or item.get("pres_name")
@@ -358,27 +440,25 @@ def build_pill_to_prescription_map(test_root: str) -> Dict[str, str]:
     return mapping
 
 
-def resolve_prescription_path(test_root: str, image_name: str, pill_to_pres: Dict[str, str]) -> Optional[str]:
-    pres_root = os.path.join(test_root, "prescription", "image")
-    if not os.path.isdir(pres_root):
+def resolve_prescription_path(
+    test_root: str,
+    row: pd.Series,
+    pill_to_pres: Dict[str, str],
+    prescription_index: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    pres_name = lookup_prescription_name_for_row(row, pill_to_pres)
+    if pres_name is None:
         return None
 
-    for k in normalize_map_key(image_name):
-        pres_name = pill_to_pres.get(k)
-        if pres_name:
-            candidates = [
-                os.path.join(pres_root, pres_name),
-                os.path.join(pres_root, os.path.basename(pres_name)),
-            ]
-            for p in candidates:
-                if os.path.exists(p):
-                    return p
+    if prescription_index is None:
+        prescription_index = build_prescription_file_index(test_root)
 
-            # fallback tìm theo stem
-            stem = os.path.splitext(os.path.basename(pres_name))[0]
-            for fn in os.listdir(pres_root):
-                if os.path.splitext(fn)[0] == stem:
-                    return os.path.join(pres_root, fn)
+    direct_candidates = [pres_name, os.path.basename(pres_name)]
+    for candidate in direct_candidates:
+        for key in normalize_map_key(candidate):
+            found = prescription_index.get(key)
+            if found and os.path.exists(found):
+                return found
 
     return None
 
@@ -472,6 +552,7 @@ def run_model_two_pass(
     group_df: pd.DataFrame,
     test_root: str,
     pill_to_pres: Dict[str, str],
+    prescription_index: Dict[str, str],
     num_classes: int,
     idx_to_label: Dict[int, str],
     device: torch.device,
@@ -479,22 +560,26 @@ def run_model_two_pass(
 ) -> List[Dict]:
     rows = []
 
-    # First pass
     first_pass_preds = []
     first_pass_confs = []
+    prescription_paths = []
 
     for _, row in group_df.iterrows():
-        image_name = row["image_name"]
         crop_path = row["crop_path"]
-        prescription_path = resolve_prescription_path(test_root, image_name, pill_to_pres)
+        prescription_path = resolve_prescription_path(
+            test_root=test_root,
+            row=row,
+            pill_to_pres=pill_to_pres,
+            prescription_index=prescription_index,
+        )
+        prescription_paths.append(prescription_path)
 
-        context_labels_first = []  # first pass luôn để context rỗng
         pred_idx, conf = predict_single(
             model_key=model_key,
             model=model,
             crop_path=crop_path,
             prescription_path=prescription_path,
-            context_labels=context_labels_first,
+            context_labels=[],
             num_classes=num_classes,
             device=device,
             tfm=tfm,
@@ -502,13 +587,12 @@ def run_model_two_pass(
         first_pass_preds.append(pred_idx)
         first_pass_confs.append(conf)
 
-    # Final pass
     for i, (_, row) in enumerate(group_df.iterrows()):
         image_name = row["image_name"]
         crop_name = row["crop_name"]
         crop_path = row["crop_path"]
         detector_score = float(row["score"])
-        prescription_path = resolve_prescription_path(test_root, image_name, pill_to_pres)
+        prescription_path = prescription_paths[i]
 
         if model_key in {"M3", "M4", "M5", "M6", "M7", "M8", "M9"}:
             context_labels_final = [first_pass_preds[j] for j in range(len(first_pass_preds)) if j != i]
@@ -529,6 +613,7 @@ def run_model_two_pass(
             used_context = False
 
         rows.append({
+            "group_key": str(row.get("_group_key", image_name)),
             "image_name": image_name,
             "crop_name": crop_name,
             "crop_path": crop_path,
@@ -545,6 +630,22 @@ def run_model_two_pass(
         })
 
     return rows
+
+
+
+def build_group_key(row: pd.Series, pill_to_pres: Dict[str, str]) -> str:
+    pres_name = lookup_prescription_name_for_row(row, pill_to_pres)
+    if pres_name:
+        return os.path.splitext(os.path.basename(pres_name))[0]
+
+    if "image_name" in row and pd.notna(row["image_name"]):
+        return str(row["image_name"])
+
+    if "crop_name" in row and pd.notna(row["crop_name"]):
+        return str(row["crop_name"])
+
+    return "unknown_group"
+
 
 
 def main(args):
@@ -571,8 +672,14 @@ def main(args):
                 raise ValueError(f"Model key không hợp lệ: {m}")
 
     pill_to_pres = build_pill_to_prescription_map(args.test_root)
+    prescription_index = build_prescription_file_index(args.test_root)
 
-    grouped = list(detections_df.groupby("image_name", sort=False))
+    detections_df["_group_key"] = detections_df.apply(
+        lambda row: build_group_key(row, pill_to_pres),
+        axis=1,
+    )
+
+    grouped = list(detections_df.groupby("_group_key", sort=False))
     print("Num detected pill images:", len(grouped))
     print("Selected models:", model_keys)
 
@@ -607,7 +714,7 @@ def main(args):
                 continue
             raise
 
-        for group_idx, (image_name, group_df) in enumerate(grouped, start=1):
+        for group_idx, (group_key, group_df) in enumerate(grouped, start=1):
             try:
                 rows = run_model_two_pass(
                     model_key=model_key,
@@ -615,6 +722,7 @@ def main(args):
                     group_df=group_df.reset_index(drop=True),
                     test_root=args.test_root,
                     pill_to_pres=pill_to_pres,
+                    prescription_index=prescription_index,
                     num_classes=num_classes,
                     idx_to_label=idx_to_label,
                     device=device,
@@ -622,7 +730,7 @@ def main(args):
                 )
                 all_rows.extend(rows)
             except Exception as e:
-                print(f"[{model_key}] Failed on image {image_name}: {e}")
+                print(f"[{model_key}] Failed on group {group_key}: {e}")
 
             if group_idx % 20 == 0 or group_idx == len(grouped):
                 print(f"[{model_key}] processed {group_idx}/{len(grouped)} images")
@@ -635,7 +743,7 @@ def main(args):
     if args.failed_models_log:
         with open(args.failed_models_log, "w", encoding="utf-8") as f:
             for k, msg in failed_models:
-                f.write(f"{k}\t{msg}\n")
+                f.write(f"{k}	{msg}\n")
         print("Saved failed model log to:", args.failed_models_log)
 
     print("Done.")

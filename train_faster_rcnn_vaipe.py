@@ -1,7 +1,7 @@
 import os
 import random
 import argparse
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -43,7 +43,6 @@ def split_indices(n: int, val_ratio: float, seed: int) -> Tuple[List[int], List[
 
     train_idx = indices[:n_train]
     val_idx = indices[n_train:]
-
     return train_idx, val_idx
 
 
@@ -54,12 +53,14 @@ def move_targets_to_device(targets, device):
     return moved
 
 
-def train_one_epoch(model, loader, optimizer, device) -> float:
+def train_one_epoch(model, loader, optimizer, device, log_interval: int = 100) -> float:
     model.train()
     running_loss = 0.0
     num_batches = 0
 
-    for images, targets in loader:
+    total_batches = len(loader)
+
+    for batch_idx, (images, targets) in enumerate(loader, start=1):
         images = [img.to(device) for img in images]
         targets = move_targets_to_device(targets, device)
 
@@ -70,14 +71,23 @@ def train_one_epoch(model, loader, optimizer, device) -> float:
         loss.backward()
         optimizer.step()
 
-        running_loss += loss.item()
+        loss_value = float(loss.item())
+        running_loss += loss_value
         num_batches += 1
+
+        if batch_idx % log_interval == 0 or batch_idx == total_batches:
+            avg_so_far = running_loss / max(1, num_batches)
+            print(
+                f"  train batch {batch_idx}/{total_batches} | "
+                f"loss={loss_value:.4f} | avg={avg_so_far:.4f}",
+                flush=True,
+            )
 
     return running_loss / max(1, num_batches)
 
 
 @torch.no_grad()
-def evaluate_loss(model, loader, device) -> float:
+def evaluate_loss(model, loader, device, log_interval: int = 100) -> float:
     """
     TorchVision detection model chỉ trả về loss khi model ở train mode và có targets.
     Vì vậy validation loss sẽ được tính trong train mode nhưng dưới no_grad().
@@ -86,15 +96,26 @@ def evaluate_loss(model, loader, device) -> float:
     running_loss = 0.0
     num_batches = 0
 
-    for images, targets in loader:
+    total_batches = len(loader)
+
+    for batch_idx, (images, targets) in enumerate(loader, start=1):
         images = [img.to(device) for img in images]
         targets = move_targets_to_device(targets, device)
 
         loss_dict = model(images, targets)
         loss = sum(v for v in loss_dict.values())
 
-        running_loss += loss.item()
+        loss_value = float(loss.item())
+        running_loss += loss_value
         num_batches += 1
+
+        if batch_idx % log_interval == 0 or batch_idx == total_batches:
+            avg_so_far = running_loss / max(1, num_batches)
+            print(
+                f"  val   batch {batch_idx}/{total_batches} | "
+                f"loss={loss_value:.4f} | avg={avg_so_far:.4f}",
+                flush=True,
+            )
 
     return running_loss / max(1, num_batches)
 
@@ -132,7 +153,7 @@ def main(args):
     os.makedirs(args.out_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
+    print("Using device:", device, flush=True)
 
     dataset = VaipeDetectionDataset(args.train_root)
     train_idx, val_idx = split_indices(len(dataset), args.val_ratio, args.seed)
@@ -177,10 +198,13 @@ def main(args):
     last_ckpt_path = os.path.join(args.out_dir, "fasterrcnn_vaipe_last.pth")
     history_path = os.path.join(args.out_dir, "train_log.txt")
 
-    print(f"Total samples : {len(dataset)}")
-    print(f"Train samples : {len(train_set)}")
-    print(f"Val samples   : {len(val_set)}")
-    print(f"Output dir    : {args.out_dir}")
+    print(f"Total samples : {len(dataset)}", flush=True)
+    print(f"Train samples : {len(train_set)}", flush=True)
+    print(f"Val samples   : {len(val_set)}", flush=True)
+    print(f"Train batches : {len(train_loader)}", flush=True)
+    print(f"Val batches   : {len(val_loader)}", flush=True)
+    print(f"Output dir    : {args.out_dir}", flush=True)
+    print(f"Log interval  : every {args.log_interval} batches", flush=True)
 
     with open(history_path, "w", encoding="utf-8") as f:
         f.write("epoch,train_loss,val_loss,lr\n")
@@ -188,8 +212,24 @@ def main(args):
     for epoch in range(1, args.epochs + 1):
         current_lr = optimizer.param_groups[0]["lr"]
 
-        train_loss = train_one_epoch(model, train_loader, optimizer, device)
-        val_loss = evaluate_loss(model, val_loader, device)
+        print("\n" + "=" * 80, flush=True)
+        print(f"Starting epoch {epoch}/{args.epochs} | lr={current_lr:.6f}", flush=True)
+        print("=" * 80, flush=True)
+
+        train_loss = train_one_epoch(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            device=device,
+            log_interval=args.log_interval,
+        )
+
+        val_loss = evaluate_loss(
+            model=model,
+            loader=val_loader,
+            device=device,
+            log_interval=args.log_interval,
+        )
 
         save_checkpoint(
             path=last_ckpt_path,
@@ -214,7 +254,7 @@ def main(args):
                 val_loss=val_loss,
                 args=args,
             )
-            print(f"Saved best checkpoint -> {best_ckpt_path}")
+            print(f"Saved best checkpoint -> {best_ckpt_path}", flush=True)
 
         with open(history_path, "a", encoding="utf-8") as f:
             f.write(f"{epoch},{train_loss:.6f},{val_loss:.6f},{current_lr:.8f}\n")
@@ -223,32 +263,32 @@ def main(args):
             f"Epoch [{epoch}/{args.epochs}] | "
             f"lr={current_lr:.6f} | "
             f"train_loss={train_loss:.4f} | "
-            f"val_loss={val_loss:.4f}"
+            f"val_loss={val_loss:.4f}",
+            flush=True,
         )
 
         scheduler.step()
 
-    print("Training detector completed.")
-    print("Best checkpoint:", best_ckpt_path)
-    print("Last checkpoint:", last_ckpt_path)
+    print("\nTraining detector completed.", flush=True)
+    print("Best checkpoint:", best_ckpt_path, flush=True)
+    print("Last checkpoint:", last_ckpt_path, flush=True)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train Faster R-CNN detector for VAIPE pill localization")
-
+    parser = argparse.ArgumentParser(
+        description="Train Faster R-CNN detector for VAIPE pill localization"
+    )
     parser.add_argument("--train_root", type=str, required=True, help="Path to public_train")
     parser.add_argument("--out_dir", type=str, default="outputs_faster_rcnn_vaipe")
     parser.add_argument("--epochs", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--num_workers", type=int, default=2)
-
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--lr_step_size", type=int, default=4)
     parser.add_argument("--lr_gamma", type=float, default=0.5)
-
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
-
+    parser.add_argument("--log_interval", type=int, default=100)
     args = parser.parse_args()
     main(args)

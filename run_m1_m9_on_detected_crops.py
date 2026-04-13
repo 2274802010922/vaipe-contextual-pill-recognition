@@ -3,7 +3,7 @@ import json
 import math
 import argparse
 import warnings
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -15,7 +15,6 @@ from torchvision import transforms
 import timm
 
 from model_registry_m1_m9 import build_model_registry
-
 from train_pika_v1_1_improved import DualEncoderPIKA
 from train_pika_v2_context_labels import PIKAV2Model
 from train_pika_v3_triple_context import TripleContextPIKA
@@ -31,14 +30,16 @@ MAX_CONTEXT_LEN = 8
 
 
 def get_val_transform(image_size: int = IMAGE_SIZE):
-    return transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        ),
-    ])
+    return transforms.Compose(
+        [
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+        ]
+    )
 
 
 def load_state_dict_flexible(checkpoint_path: str, device: torch.device) -> Dict[str, torch.Tensor]:
@@ -50,9 +51,12 @@ def load_state_dict_flexible(checkpoint_path: str, device: torch.device) -> Dict
 
 def infer_num_classes_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> int:
     for key, value in state_dict.items():
-        if key.endswith("classifier.weight") and value.ndim == 2:
+        if key.endswith("classifier.weight") and getattr(value, "ndim", None) == 2:
             return int(value.shape[0])
-    raise RuntimeError("Không suy ra được num_classes từ state_dict (không thấy classifier.weight).")
+    for key, value in state_dict.items():
+        if key.endswith("classifier.bias") and getattr(value, "ndim", None) == 1:
+            return int(value.shape[0])
+    raise RuntimeError("Không suy ra được num_classes từ state_dict.")
 
 
 def normalize_adjacency(adj: np.ndarray) -> np.ndarray:
@@ -91,7 +95,7 @@ def dedupe_keep_order(items: List[str]) -> List[str]:
 
 
 def guess_artifact_dirs(model_key: str, artifact_root: Optional[str]) -> List[str]:
-    dirs = []
+    dirs: List[str] = []
 
     if artifact_root:
         primary_mapping = {
@@ -108,12 +112,13 @@ def guess_artifact_dirs(model_key: str, artifact_root: Optional[str]) -> List[st
         alias_mapping = {
             "M5": ["M5_pika_graph", "processed_pika_graph", "M6_best_pika_pre_ft"],
             "M6": ["processed_pika_best"],
-            "M7": ["M6_best_pika_pre_ft", "processed_pika_best"],
-            "M8": ["M6_best_pika_pre_ft", "processed_pika_best"],
-            "M9": ["M6_best_pika_pre_ft", "processed_pika_best"],
+            "M7": ["M7_best_pika_pre_ft", "M6_best_pika_pre_ft", "processed_pika_best"],
+            "M8": ["M8_best_pika_pre_ft", "M6_best_pika_pre_ft", "processed_pika_best"],
+            "M9": ["M9_best_pika_pre_ft", "M6_best_pika_pre_ft", "processed_pika_best"],
         }
 
-        dirs.append(os.path.join(artifact_root, primary_mapping[model_key]))
+        if model_key in primary_mapping:
+            dirs.append(os.path.join(artifact_root, primary_mapping[model_key]))
         for alias in alias_mapping.get(model_key, []):
             dirs.append(os.path.join(artifact_root, alias))
 
@@ -128,8 +133,7 @@ def guess_artifact_dirs(model_key: str, artifact_root: Optional[str]) -> List[st
         "M8": ["/content/processed_pika_best"],
         "M9": ["/content/processed_pika_best"],
     }
-    dirs.extend(fallback[model_key])
-
+    dirs.extend(fallback.get(model_key, []))
     return dedupe_keep_order(dirs)
 
 
@@ -139,21 +143,29 @@ def build_idx_to_label_map_from_csv(csv_path: str) -> Optional[Dict[int, str]]:
     except Exception:
         return None
 
-    required = {"mapped_label", "pill_label"}
-    if not required.issubset(df.columns):
-        return None
+    if "mapped_label" in df.columns and "pill_label" in df.columns:
+        pairs = df[["mapped_label", "pill_label"]].drop_duplicates()
+        idx_to_label: Dict[int, str] = {}
+        for _, row in pairs.iterrows():
+            try:
+                idx_to_label[int(row["mapped_label"])] = str(int(row["pill_label"]))
+            except Exception:
+                continue
+        if idx_to_label:
+            return idx_to_label
 
-    pairs = df[["mapped_label", "pill_label"]].drop_duplicates()
-    idx_to_label = {}
-    for _, row in pairs.iterrows():
-        idx_to_label[int(row["mapped_label"])] = str(int(row["pill_label"]))
-    return idx_to_label
+    if "pill_label" in df.columns:
+        counts = df["pill_label"].value_counts()
+        valid_labels = sorted([int(lbl) for lbl, cnt in counts.items() if int(cnt) >= 2])
+        if valid_labels:
+            return {i: str(lbl) for i, lbl in enumerate(valid_labels)}
+
+    return None
 
 
 def load_idx_to_label_map(model_key: str, artifact_root: Optional[str], num_classes: int) -> Dict[int, str]:
     candidate_dirs = guess_artifact_dirs(model_key, artifact_root)
 
-    # 1) ưu tiên idx_to_label.json
     for d in candidate_dirs:
         p = os.path.join(d, "idx_to_label.json")
         if os.path.exists(p):
@@ -163,7 +175,6 @@ def load_idx_to_label_map(model_key: str, artifact_root: Optional[str], num_clas
             if isinstance(data, list):
                 return {i: str(v) for i, v in enumerate(data)}
 
-    # 2) fallback từ metadata csv
     csv_names = [
         "pika_metadata.csv",
         "pika_context_metadata.csv",
@@ -176,10 +187,9 @@ def load_idx_to_label_map(model_key: str, artifact_root: Optional[str], num_clas
             p = os.path.join(d, name)
             if os.path.exists(p):
                 mapping = build_idx_to_label_map_from_csv(p)
-                if mapping is not None and len(mapping) > 0:
+                if mapping:
                     return mapping
 
-    # 3) fallback identity
     warnings.warn(
         f"[{model_key}] Không tìm thấy idx_to_label mapping. "
         f"Sẽ dùng mapped class index làm nhãn tạm thời."
@@ -187,20 +197,24 @@ def load_idx_to_label_map(model_key: str, artifact_root: Optional[str], num_clas
     return {i: str(i) for i in range(num_classes)}
 
 
-def load_graph_artifact(model_key: str, artifact_root: Optional[str], num_classes: int, device: torch.device) -> torch.Tensor:
+def load_graph_artifact(
+    model_key: str,
+    artifact_root: Optional[str],
+    num_classes: int,
+    device: torch.device,
+) -> torch.Tensor:
     candidate_dirs = guess_artifact_dirs(model_key, artifact_root)
 
     graph_json_candidates = []
     graph_npy_candidates = []
-
     for d in candidate_dirs:
-        graph_json_candidates.extend([
-            os.path.join(d, "graph_labels.json"),
-        ])
-        graph_npy_candidates.extend([
-            os.path.join(d, "graph_pmi.npy"),
-            os.path.join(d, "graph_cooccur.npy"),
-        ])
+        graph_json_candidates.append(os.path.join(d, "graph_labels.json"))
+        graph_npy_candidates.extend(
+            [
+                os.path.join(d, "graph_pmi.npy"),
+                os.path.join(d, "graph_cooccur.npy"),
+            ]
+        )
 
     graph_json_path = find_first_existing(graph_json_candidates)
     graph_npy_path = find_first_existing(graph_npy_candidates)
@@ -213,19 +227,16 @@ def load_graph_artifact(model_key: str, artifact_root: Optional[str], num_classe
 
     graph_matrix = np.load(graph_npy_path)
 
-    # Trường hợp đơn giản nhất: graph đã đúng kích thước num_classes
     if graph_matrix.shape[0] == num_classes and graph_matrix.shape[1] == num_classes:
         sub_graph = graph_matrix
     else:
-        # Nếu có graph_labels.json và idx_to_label map thì cố subselect
         idx_to_label = load_idx_to_label_map(model_key, artifact_root, num_classes)
-        original_labels = [int(idx_to_label[i]) for i in range(num_classes)]
+        original_labels = [int(idx_to_label.get(i, i)) for i in range(num_classes)]
 
         if graph_json_path is not None:
-            graph_labels = load_json(graph_json_path)
-            graph_label_to_idx = {int(lbl): idx for idx, lbl in enumerate(graph_labels)}
-
             try:
+                graph_labels = load_json(graph_json_path)
+                graph_label_to_idx = {int(lbl): idx for idx, lbl in enumerate(graph_labels)}
                 indices = [graph_label_to_idx[int(lbl)] for lbl in original_labels]
                 sub_graph = graph_matrix[np.ix_(indices, indices)]
             except Exception:
@@ -245,7 +256,12 @@ def load_graph_artifact(model_key: str, artifact_root: Optional[str], num_classe
     return torch.tensor(sub_graph, dtype=torch.float32, device=device)
 
 
-def build_model_from_spec(model_key: str, checkpoint_path: str, artifact_root: Optional[str], device: torch.device):
+def build_model_from_spec(
+    model_key: str,
+    checkpoint_path: str,
+    artifact_root: Optional[str],
+    device: torch.device,
+):
     state_dict = load_state_dict_flexible(checkpoint_path, device)
     num_classes = infer_num_classes_from_state_dict(state_dict)
 
@@ -255,27 +271,23 @@ def build_model_from_spec(model_key: str, checkpoint_path: str, artifact_root: O
             pretrained=False,
             num_classes=num_classes,
         )
-
     elif model_key == "M2":
         model = DualEncoderPIKA(
             num_classes=num_classes,
             pill_model_name=PILL_MODEL_NAME,
             pres_model_name=PRES_MODEL_NAME,
         )
-
     elif model_key == "M3":
         model = PIKAV2Model(
             num_classes=num_classes,
             pill_model_name=PILL_MODEL_NAME,
         )
-
     elif model_key == "M4":
         model = TripleContextPIKA(
             num_classes=num_classes,
             pill_model_name=PILL_MODEL_NAME,
             pres_model_name=PRES_MODEL_NAME,
         )
-
     elif model_key == "M5":
         adj = load_graph_artifact(model_key, artifact_root, num_classes, device)
         model = PIKAGraphModel(
@@ -284,7 +296,6 @@ def build_model_from_spec(model_key: str, checkpoint_path: str, artifact_root: O
             pill_model_name=PILL_MODEL_NAME,
             hidden_dim=GRAPH_HIDDEN_DIM,
         )
-
     elif model_key in {"M6", "M7", "M8", "M9"}:
         adj = load_graph_artifact(model_key, artifact_root, num_classes, device)
         model = BestPIKAModel(
@@ -294,14 +305,16 @@ def build_model_from_spec(model_key: str, checkpoint_path: str, artifact_root: O
             pres_model_name=PRES_MODEL_NAME,
             hidden_dim=GRAPH_HIDDEN_DIM,
         )
-
     else:
         raise ValueError(f"Model key không hợp lệ: {model_key}")
 
-    model.load_state_dict(state_dict, strict=True)
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except Exception as e:
+        raise RuntimeError(f"Load state_dict strict=True thất bại: {e}") from e
+
     model.to(device)
     model.eval()
-
     idx_to_label = load_idx_to_label_map(model_key, artifact_root, num_classes)
     return model, num_classes, idx_to_label
 
@@ -310,37 +323,67 @@ def normalize_map_key(name: str) -> List[str]:
     name = str(name)
     base = os.path.basename(name)
     stem = os.path.splitext(base)[0]
+
     keys = [name, base, stem]
 
     if "_det_" in stem:
         original_stem = stem.split("_det_")[0]
-        keys.append(original_stem)
-        keys.append(original_stem + ".jpg")
-        keys.append(original_stem + ".png")
+        keys.extend(
+            [
+                original_stem,
+                original_stem + ".jpg",
+                original_stem + ".png",
+            ]
+        )
 
     return dedupe_keep_order(keys)
 
 
 def extract_row_identifier_candidates(row: pd.Series) -> List[str]:
-    candidates = []
-
-    for col in ["image_name", "crop_name", "image_path", "crop_path"]:
+    candidates: List[str] = []
+    for col in ["image_name", "crop_name", "image_path", "crop_path", "crop_path_original"]:
         if col in row and pd.notna(row[col]):
             value = str(row[col]).strip()
             if value:
                 candidates.append(value)
                 candidates.append(os.path.basename(value))
-
     return dedupe_keep_order(candidates)
 
 
-def lookup_prescription_name_for_row(row: pd.Series, pill_to_pres: Dict[str, str]) -> Optional[str]:
-    for candidate in extract_row_identifier_candidates(row):
-        for key in normalize_map_key(candidate):
-            pres_name = pill_to_pres.get(key)
-            if pres_name:
-                return str(pres_name)
-    return None
+def resolve_detection_crop_path(row: pd.Series, detections_csv: str) -> str:
+    """
+    Resolve crop_path robustly even when detections.csv was created in
+    an older runtime path and later moved elsewhere.
+    """
+    detections_dir = os.path.dirname(os.path.abspath(detections_csv))
+
+    raw_crop_path = str(row.get("crop_path", "") or "").strip()
+    crop_name = str(row.get("crop_name", "") or "").strip()
+
+    candidates: List[str] = []
+
+    if raw_crop_path:
+        base = os.path.basename(raw_crop_path)
+        candidates.extend(
+            [
+                raw_crop_path,
+                os.path.abspath(raw_crop_path),
+                os.path.join(detections_dir, base),
+                os.path.join(detections_dir, "crops", base),
+            ]
+        )
+
+    if crop_name:
+        candidates.extend(
+            [
+                os.path.join(detections_dir, crop_name),
+                os.path.join(detections_dir, "crops", crop_name),
+            ]
+        )
+
+    candidates = dedupe_keep_order(candidates)
+    resolved = find_first_existing(candidates)
+    return resolved if resolved is not None else raw_crop_path
 
 
 def build_prescription_file_index(test_root: str) -> Dict[str, str]:
@@ -351,7 +394,7 @@ def build_prescription_file_index(test_root: str) -> Dict[str, str]:
         os.path.join(test_root, "pres"),
     ]
 
-    index = {}
+    index: Dict[str, str] = {}
     for root_dir in candidate_dirs:
         if not os.path.isdir(root_dir):
             continue
@@ -361,7 +404,6 @@ def build_prescription_file_index(test_root: str) -> Dict[str, str]:
                 continue
             for key in normalize_map_key(fn):
                 index[key] = full_path
-
     return index
 
 
@@ -373,89 +415,67 @@ def build_pill_to_prescription_map(test_root: str) -> Dict[str, str]:
     map_path = find_first_existing(candidates)
 
     if map_path is None:
-        warnings.warn("Không tìm thấy pill_pres_map.json. Các model cần prescription có thể không chạy được.")
+        warnings.warn("Không tìm thấy pill_pres_map.json.")
         return {}
 
     data = load_json(map_path)
-    mapping = {}
-
-    def add_entry(pill_name, pres_name):
-        if pill_name is None or pres_name is None:
-            return
-
-        if isinstance(pill_name, (list, tuple, set)):
-            for item in pill_name:
-                add_entry(item, pres_name)
-            return
-
-        for key in normalize_map_key(str(pill_name)):
-            mapping[key] = str(pres_name)
+    out: Dict[str, str] = {}
 
     if isinstance(data, dict):
-        simple = True
         for k, v in data.items():
-            if isinstance(v, str):
-                add_entry(k, v)
-            else:
-                simple = False
-
-        if not simple:
-            for _, item in data.items():
-                if not isinstance(item, dict):
-                    continue
-                pill_name = (
-                    item.get("pill")
-                    or item.get("pill_image")
-                    or item.get("pill_image_name")
-                    or item.get("pill_name")
-                )
-                pres_name = (
-                    item.get("pres")
-                    or item.get("prescription")
-                    or item.get("prescription_image")
-                    or item.get("prescription_image_name")
-                    or item.get("pres_name")
-                )
-                add_entry(pill_name, pres_name)
-
+            if v is None:
+                continue
+            for kk in normalize_map_key(str(k)):
+                out[kk] = str(v)
     elif isinstance(data, list):
         for item in data:
             if not isinstance(item, dict):
                 continue
             pill_name = (
-                item.get("pill")
+                item.get("pill_name")
                 or item.get("pill_image")
-                or item.get("pill_image_name")
-                or item.get("pill_name")
+                or item.get("pill")
+                or item.get("image_name")
             )
             pres_name = (
-                item.get("pres")
-                or item.get("prescription")
+                item.get("prescription_name")
                 or item.get("prescription_image")
-                or item.get("prescription_image_name")
+                or item.get("prescription")
                 or item.get("pres_name")
             )
-            add_entry(pill_name, pres_name)
+            if pill_name and pres_name:
+                for kk in normalize_map_key(str(pill_name)):
+                    out[kk] = str(pres_name)
+    else:
+        warnings.warn("pill_pres_map.json có format lạ, sẽ bỏ qua.")
 
-    return mapping
+    return out
+
+
+def lookup_prescription_name_for_row(row: pd.Series, pill_to_pres: Dict[str, str]) -> Optional[str]:
+    for candidate in extract_row_identifier_candidates(row):
+        for key in normalize_map_key(candidate):
+            pres_name = pill_to_pres.get(key)
+            if pres_name:
+                return str(pres_name)
+    return None
 
 
 def resolve_prescription_path(
     test_root: str,
     row: pd.Series,
     pill_to_pres: Dict[str, str],
-    prescription_index: Optional[Dict[str, str]] = None,
+    prescription_index: Dict[str, str],
 ) -> Optional[str]:
+    for col in ["prescription_path", "prescription_image_path"]:
+        if col in row and pd.notna(row[col]):
+            p = str(row[col]).strip()
+            if p and os.path.exists(p):
+                return p
+
     pres_name = lookup_prescription_name_for_row(row, pill_to_pres)
-    if pres_name is None:
-        return None
-
-    if prescription_index is None:
-        prescription_index = build_prescription_file_index(test_root)
-
-    direct_candidates = [pres_name, os.path.basename(pres_name)]
-    for candidate in direct_candidates:
-        for key in normalize_map_key(candidate):
+    if pres_name:
+        for key in normalize_map_key(pres_name):
             found = prescription_index.get(key)
             if found and os.path.exists(found):
                 return found
@@ -469,9 +489,15 @@ def load_image_tensor(image_path: str, tfm, device: torch.device) -> torch.Tenso
     return tensor
 
 
+def make_zero_image_tensor(tfm, device: torch.device) -> torch.Tensor:
+    img = Image.new("RGB", (IMAGE_SIZE, IMAGE_SIZE), color=(0, 0, 0))
+    tensor = tfm(img).unsqueeze(0).to(device)
+    return tensor
+
+
 def build_context_vector(context_labels: List[int], num_classes: int, device: torch.device) -> torch.Tensor:
     vec = torch.zeros((1, num_classes), dtype=torch.float32, device=device)
-    for lbl in sorted(set(context_labels)):
+    for lbl in sorted(set(int(x) for x in context_labels)):
         if 0 <= int(lbl) < num_classes:
             vec[0, int(lbl)] = 1.0
     return vec
@@ -483,7 +509,6 @@ def build_context_indices_and_mask(context_labels: List[int], max_context_len: i
 
     padded = [-1] * max_context_len
     mask = [0] * max_context_len
-
     for i, val in enumerate(context_labels):
         padded[i] = int(val)
         mask[i] = 1
@@ -510,9 +535,11 @@ def predict_single(
         logits = model(pill_tensor)
 
     elif model_key == "M2":
-        if prescription_path is None:
-            raise FileNotFoundError("[M2] Không tìm thấy prescription image cho crop này.")
-        pres_tensor = load_image_tensor(prescription_path, tfm, device)
+        pres_tensor = (
+            load_image_tensor(prescription_path, tfm, device)
+            if prescription_path and os.path.exists(prescription_path)
+            else make_zero_image_tensor(tfm, device)
+        )
         logits = model(pill_tensor, pres_tensor)
 
     elif model_key == "M3":
@@ -520,21 +547,33 @@ def predict_single(
         logits = model(pill_tensor, context_vector)
 
     elif model_key == "M4":
-        if prescription_path is None:
-            raise FileNotFoundError("[M4] Không tìm thấy prescription image cho crop này.")
-        pres_tensor = load_image_tensor(prescription_path, tfm, device)
+        pres_tensor = (
+            load_image_tensor(prescription_path, tfm, device)
+            if prescription_path and os.path.exists(prescription_path)
+            else make_zero_image_tensor(tfm, device)
+        )
         context_vector = build_context_vector(context_labels, num_classes, device)
         logits = model(pill_tensor, pres_tensor, context_vector)
 
     elif model_key == "M5":
-        context_indices, context_mask = build_context_indices_and_mask(context_labels, MAX_CONTEXT_LEN, device)
+        context_indices, context_mask = build_context_indices_and_mask(
+            context_labels=context_labels,
+            max_context_len=MAX_CONTEXT_LEN,
+            device=device,
+        )
         logits = model(pill_tensor, context_indices, context_mask)
 
     elif model_key in {"M6", "M7", "M8", "M9"}:
-        if prescription_path is None:
-            raise FileNotFoundError(f"[{model_key}] Không tìm thấy prescription image cho crop này.")
-        pres_tensor = load_image_tensor(prescription_path, tfm, device)
-        context_indices, context_mask = build_context_indices_and_mask(context_labels, MAX_CONTEXT_LEN, device)
+        pres_tensor = (
+            load_image_tensor(prescription_path, tfm, device)
+            if prescription_path and os.path.exists(prescription_path)
+            else make_zero_image_tensor(tfm, device)
+        )
+        context_indices, context_mask = build_context_indices_and_mask(
+            context_labels=context_labels,
+            max_context_len=MAX_CONTEXT_LEN,
+            device=device,
+        )
         logits = model(pill_tensor, pres_tensor, context_indices, context_mask)
 
     else:
@@ -542,7 +581,6 @@ def predict_single(
 
     probs = torch.softmax(logits, dim=1)
     conf, pred_idx = torch.max(probs, dim=1)
-
     return int(pred_idx.item()), float(conf.item())
 
 
@@ -558,14 +596,14 @@ def run_model_two_pass(
     device: torch.device,
     tfm,
 ) -> List[Dict]:
-    rows = []
+    rows: List[Dict] = []
 
-    first_pass_preds = []
-    first_pass_confs = []
-    prescription_paths = []
+    first_pass_preds: List[int] = []
+    first_pass_confs: List[float] = []
+    prescription_paths: List[Optional[str]] = []
 
     for _, row in group_df.iterrows():
-        crop_path = row["crop_path"]
+        crop_path = str(row["crop_path"])
         prescription_path = resolve_prescription_path(
             test_root=test_root,
             row=row,
@@ -587,50 +625,66 @@ def run_model_two_pass(
         first_pass_preds.append(pred_idx)
         first_pass_confs.append(conf)
 
+    context_enabled_models = {"M3", "M4", "M5", "M6", "M7", "M8", "M9"}
+
     for i, (_, row) in enumerate(group_df.iterrows()):
-        image_name = row["image_name"]
-        crop_name = row["crop_name"]
-        crop_path = row["crop_path"]
-        detector_score = float(row["score"])
+        crop_path = str(row["crop_path"])
         prescription_path = prescription_paths[i]
 
-        if model_key in {"M3", "M4", "M5", "M6", "M7", "M8", "M9"}:
-            context_labels_final = [first_pass_preds[j] for j in range(len(first_pass_preds)) if j != i]
+        context_labels: List[int] = []
+        used_context = 0
+
+        if model_key in context_enabled_models and len(group_df) > 1:
+            context_labels = [
+                int(first_pass_preds[j])
+                for j in range(len(first_pass_preds))
+                if j != i and 0 <= int(first_pass_preds[j]) < num_classes
+            ]
+            if len(context_labels) > 0:
+                used_context = 1
+
+        if used_context:
             pred_idx_final, conf_final = predict_single(
                 model_key=model_key,
                 model=model,
                 crop_path=crop_path,
                 prescription_path=prescription_path,
-                context_labels=context_labels_final,
+                context_labels=context_labels,
                 num_classes=num_classes,
                 device=device,
                 tfm=tfm,
             )
-            used_context = True
         else:
             pred_idx_final = first_pass_preds[i]
             conf_final = first_pass_confs[i]
-            used_context = False
 
-        rows.append({
-            "group_key": str(row.get("_group_key", image_name)),
-            "image_name": image_name,
-            "crop_name": crop_name,
-            "crop_path": crop_path,
-            "model_key": model_key,
-            "detector_score": detector_score,
-            "prescription_path": prescription_path if prescription_path is not None else "",
-            "pred_idx_first": int(first_pass_preds[i]),
-            "pred_label_first": idx_to_label.get(int(first_pass_preds[i]), str(int(first_pass_preds[i]))),
-            "conf_first": float(first_pass_confs[i]),
-            "pred_idx_final": int(pred_idx_final),
-            "pred_label_final": idx_to_label.get(int(pred_idx_final), str(int(pred_idx_final))),
-            "conf_final": float(conf_final),
-            "used_context_in_final_pass": int(used_context),
-        })
+        pred_idx_first = first_pass_preds[i]
+        conf_first = first_pass_confs[i]
+
+        pred_label_first = idx_to_label.get(pred_idx_first, str(pred_idx_first))
+        pred_label_final = idx_to_label.get(pred_idx_final, str(pred_idx_final))
+
+        detector_score = row["score"] if "score" in row else row.get("detector_score", np.nan)
+
+        rows.append(
+            {
+                "image_name": row["image_name"] if "image_name" in row else "",
+                "crop_name": row["crop_name"] if "crop_name" in row else os.path.basename(crop_path),
+                "crop_path": crop_path,
+                "model_key": model_key,
+                "detector_score": detector_score,
+                "prescription_path": prescription_path if prescription_path else "",
+                "pred_idx_first": int(pred_idx_first),
+                "pred_label_first": str(pred_label_first),
+                "conf_first": float(conf_first),
+                "pred_idx_final": int(pred_idx_final),
+                "pred_label_final": str(pred_label_final),
+                "conf_final": float(conf_final),
+                "used_context_in_final_pass": int(used_context),
+            }
+        )
 
     return rows
-
 
 
 def build_group_key(row: pd.Series, pill_to_pres: Dict[str, str]) -> str:
@@ -647,14 +701,56 @@ def build_group_key(row: pd.Series, pill_to_pres: Dict[str, str]) -> str:
     return "unknown_group"
 
 
+def _resolve_checkpoint_path_from_registry(spec) -> str:
+    for attr in ["checkpoint_path", "path", "ckpt_path", "model_path"]:
+        if hasattr(spec, attr):
+            val = getattr(spec, attr)
+            if isinstance(val, str) and val:
+                return val
+    raise AttributeError("Không lấy được checkpoint_path từ model registry spec.")
+
 
 def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
     detections_df = pd.read_csv(args.detections_csv)
+
     if len(detections_df) == 0:
         raise RuntimeError("detections.csv đang rỗng.")
+
+    required_cols = {"image_name", "crop_name", "crop_path"}
+    missing_cols = required_cols - set(detections_df.columns)
+    if missing_cols:
+        raise RuntimeError(f"detections.csv thiếu cột bắt buộc: {sorted(missing_cols)}")
+
+    detections_df["crop_path_original"] = detections_df["crop_path"].astype(str)
+    detections_df["crop_path"] = detections_df.apply(
+        lambda row: resolve_detection_crop_path(row, args.detections_csv),
+        axis=1,
+    )
+
+    missing_mask = ~detections_df["crop_path"].apply(
+        lambda p: isinstance(p, str) and os.path.exists(p)
+    )
+
+    if missing_mask.any():
+        num_missing = int(missing_mask.sum())
+        warnings.warn(
+            f"Không resolve được {num_missing} crop path. "
+            f"Các dòng này sẽ bị bỏ qua."
+        )
+        debug_cols = ["image_name", "crop_name", "crop_path_original", "crop_path"]
+        print("\n[MISSING CROP PATH SAMPLE]")
+        print(detections_df.loc[missing_mask, debug_cols].head(10).to_string(index=False))
+
+        detections_df = detections_df.loc[~missing_mask].copy()
+
+    if len(detections_df) == 0:
+        raise RuntimeError(
+            "Sau khi resolve crop_path, không còn crop hợp lệ nào. "
+            "Hãy kiểm tra thư mục crops nằm cùng cấp với detections.csv."
+        )
 
     tfm = get_val_transform(IMAGE_SIZE)
 
@@ -667,9 +763,10 @@ def main(args):
         model_keys = list(registry.keys())
     else:
         model_keys = [m.strip() for m in args.models.split(",") if m.strip()]
-        for m in model_keys:
-            if m not in registry:
-                raise ValueError(f"Model key không hợp lệ: {m}")
+
+    for m in model_keys:
+        if m not in registry:
+            raise ValueError(f"Model key không hợp lệ: {m}")
 
     pill_to_pres = build_pill_to_prescription_map(args.test_root)
     prescription_index = build_prescription_file_index(args.test_root)
@@ -678,17 +775,17 @@ def main(args):
         lambda row: build_group_key(row, pill_to_pres),
         axis=1,
     )
-
     grouped = list(detections_df.groupby("_group_key", sort=False))
+
     print("Num detected pill images:", len(grouped))
     print("Selected models:", model_keys)
 
-    all_rows = []
-    failed_models = []
+    all_rows: List[Dict] = []
+    failed_models: List = []
 
     for model_key in model_keys:
         spec = registry[model_key]
-        checkpoint_path = spec.checkpoint_path
+        checkpoint_path = _resolve_checkpoint_path_from_registry(spec)
 
         if not os.path.exists(checkpoint_path):
             msg = f"[{model_key}] Không tìm thấy checkpoint: {checkpoint_path}"
@@ -741,9 +838,10 @@ def main(args):
     print("Saved predictions to:", args.output_csv)
 
     if args.failed_models_log:
+        os.makedirs(os.path.dirname(args.failed_models_log) or ".", exist_ok=True)
         with open(args.failed_models_log, "w", encoding="utf-8") as f:
             for k, msg in failed_models:
-                f.write(f"{k}	{msg}\n")
+                f.write(f"{k} {msg}\n")
         print("Saved failed model log to:", args.failed_models_log)
 
     print("Done.")
@@ -751,16 +849,49 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run M1-M9 recognition on detector crops from public_test")
-
-    parser.add_argument("--detections_csv", type=str, required=True, help="CSV từ detect_public_test_faster_rcnn.py")
-    parser.add_argument("--test_root", type=str, required=True, help="Path tới public_test")
-    parser.add_argument("--model_dir", type=str, required=True, help="Thư mục chứa M1..M9 .pth")
-    parser.add_argument("--artifact_root", type=str, default="", help="Thư mục chứa artifact phụ trợ nếu có")
-    parser.add_argument("--models", type=str, default="all", help='Ví dụ: "all" hoặc "M1,M2,M9"')
-    parser.add_argument("--output_csv", type=str, default="outputs_m1_m9_predictions/m1_m9_predictions.csv")
-    parser.add_argument("--failed_models_log", type=str, default="outputs_m1_m9_predictions/failed_models.txt")
+    parser = argparse.ArgumentParser(
+        description="Run M1-M9 recognition on detector crops from public_test"
+    )
+    parser.add_argument(
+        "--detections_csv",
+        type=str,
+        required=True,
+        help="CSV từ detect_public_test_faster_rcnn.py",
+    )
+    parser.add_argument(
+        "--test_root",
+        type=str,
+        required=True,
+        help="Path tới public_test",
+    )
+    parser.add_argument(
+        "--model_dir",
+        type=str,
+        required=True,
+        help="Thư mục chứa M1..M9 .pth",
+    )
+    parser.add_argument(
+        "--artifact_root",
+        type=str,
+        default="",
+        help="Thư mục chứa artifact phụ trợ nếu có",
+    )
+    parser.add_argument(
+        "--models",
+        type=str,
+        default="all",
+        help='Ví dụ: "all" hoặc "M1,M2,M9"',
+    )
+    parser.add_argument(
+        "--output_csv",
+        type=str,
+        default="outputs_m1_m9_predictions/m1_m9_predictions.csv",
+    )
+    parser.add_argument(
+        "--failed_models_log",
+        type=str,
+        default="outputs_m1_m9_predictions/failed_models.txt",
+    )
     parser.add_argument("--skip_missing_models", action="store_true")
-
     args = parser.parse_args()
     main(args)

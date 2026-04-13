@@ -1,6 +1,5 @@
 import os
 import json
-import math
 import argparse
 import warnings
 from typing import Dict, List, Optional
@@ -10,12 +9,11 @@ import pandas as pd
 from PIL import Image
 
 import torch
-import torch.nn as nn
 from torchvision import transforms
 import timm
 
 from model_registry_m1_m9 import build_model_registry
-from train_pika_v1_1_improved import DualEncoderPIKA
+from train_pika_baseline import DualEncoderPIKA
 from train_pika_v2_context_labels import PIKAV2Model
 from train_pika_v3_triple_context import TripleContextPIKA
 from train_pika_graph import PIKAGraphModel
@@ -42,7 +40,7 @@ def get_val_transform(image_size: int = IMAGE_SIZE):
     )
 
 
-def load_state_dict_flexible(checkpoint_path: str, device: torch.device) -> Dict[str, torch.Tensor]:
+def load_state_dict_flexible(checkpoint_path: str, device: torch.device):
     ckpt = torch.load(checkpoint_path, map_location=device)
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         return ckpt["model_state_dict"]
@@ -308,13 +306,10 @@ def build_model_from_spec(
     else:
         raise ValueError(f"Model key không hợp lệ: {model_key}")
 
-    try:
-        model.load_state_dict(state_dict, strict=True)
-    except Exception as e:
-        raise RuntimeError(f"Load state_dict strict=True thất bại: {e}") from e
-
+    model.load_state_dict(state_dict, strict=True)
     model.to(device)
     model.eval()
+
     idx_to_label = load_idx_to_label_map(model_key, artifact_root, num_classes)
     return model, num_classes, idx_to_label
 
@@ -333,6 +328,7 @@ def normalize_map_key(name: str) -> List[str]:
                 original_stem,
                 original_stem + ".jpg",
                 original_stem + ".png",
+                original_stem + ".json",
             ]
         )
 
@@ -351,10 +347,6 @@ def extract_row_identifier_candidates(row: pd.Series) -> List[str]:
 
 
 def resolve_detection_crop_path(row: pd.Series, detections_csv: str) -> str:
-    """
-    Resolve crop_path robustly even when detections.csv was created in
-    an older runtime path and later moved elsewhere.
-    """
     detections_dir = os.path.dirname(os.path.abspath(detections_csv))
 
     raw_crop_path = str(row.get("crop_path", "") or "").strip()
@@ -427,10 +419,29 @@ def build_pill_to_prescription_map(test_root: str) -> Dict[str, str]:
                 continue
             for kk in normalize_map_key(str(k)):
                 out[kk] = str(v)
+
     elif isinstance(data, list):
         for item in data:
             if not isinstance(item, dict):
                 continue
+
+            # Format chuẩn VAIPE:
+            # {"pres": "VAIPE_P_TEST_0.json", "pill": ["VAIPE_P_0_0.json", ...]}
+            if "pres" in item and "pill" in item:
+                pres_name = item.get("pres")
+                pill_list = item.get("pill")
+
+                if pres_name and isinstance(pill_list, list):
+                    for pill_name in pill_list:
+                        for kk in normalize_map_key(str(pill_name)):
+                            out[kk] = str(pres_name)
+                    continue
+
+                if pres_name and pill_list and not isinstance(pill_list, list):
+                    for kk in normalize_map_key(str(pill_list)):
+                        out[kk] = str(pres_name)
+                    continue
+
             pill_name = (
                 item.get("pill_name")
                 or item.get("pill_image")
@@ -442,13 +453,21 @@ def build_pill_to_prescription_map(test_root: str) -> Dict[str, str]:
                 or item.get("prescription_image")
                 or item.get("prescription")
                 or item.get("pres_name")
+                or item.get("pres")
             )
-            if pill_name and pres_name:
+
+            if pres_name and isinstance(pill_name, list):
+                for p in pill_name:
+                    for kk in normalize_map_key(str(p)):
+                        out[kk] = str(pres_name)
+            elif pill_name and pres_name:
                 for kk in normalize_map_key(str(pill_name)):
                     out[kk] = str(pres_name)
+
     else:
         warnings.warn("pill_pres_map.json có format lạ, sẽ bỏ qua.")
 
+    print(f"Loaded pill->pres map entries: {len(out)} from {map_path}")
     return out
 
 
@@ -715,7 +734,6 @@ def main(args):
     print("Using device:", device)
 
     detections_df = pd.read_csv(args.detections_csv)
-
     if len(detections_df) == 0:
         raise RuntimeError("detections.csv đang rỗng.")
 
@@ -743,7 +761,6 @@ def main(args):
         debug_cols = ["image_name", "crop_name", "crop_path_original", "crop_path"]
         print("\n[MISSING CROP PATH SAMPLE]")
         print(detections_df.loc[missing_mask, debug_cols].head(10).to_string(index=False))
-
         detections_df = detections_df.loc[~missing_mask].copy()
 
     if len(detections_df) == 0:
@@ -777,7 +794,8 @@ def main(args):
     )
     grouped = list(detections_df.groupby("_group_key", sort=False))
 
-    print("Num detected pill images:", len(grouped))
+    print("Num detected groups:", len(grouped))
+    print("Num detected crops:", len(detections_df))
     print("Selected models:", model_keys)
 
     all_rows: List[Dict] = []
@@ -830,7 +848,7 @@ def main(args):
                 print(f"[{model_key}] Failed on group {group_key}: {e}")
 
             if group_idx % 20 == 0 or group_idx == len(grouped):
-                print(f"[{model_key}] processed {group_idx}/{len(grouped)} images")
+                print(f"[{model_key}] processed {group_idx}/{len(grouped)} groups")
 
     out_df = pd.DataFrame(all_rows)
     os.makedirs(os.path.dirname(args.output_csv) or ".", exist_ok=True)

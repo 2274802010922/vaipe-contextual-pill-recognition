@@ -1,10 +1,8 @@
 import os
 import json
-import math
 import random
 import argparse
-from collections import Counter
-from typing import Dict, List
+from typing import Dict, List, Set
 
 import pandas as pd
 
@@ -14,8 +12,8 @@ def load_json(path: str):
         return json.load(f)
 
 
-def stem_no_ext(name: str) -> str:
-    return os.path.splitext(os.path.basename(str(name)))[0]
+def stem_no_ext(x: str) -> str:
+    return os.path.splitext(os.path.basename(str(x)))[0]
 
 
 def ensure_dir(path: str):
@@ -25,77 +23,64 @@ def ensure_dir(path: str):
 def load_public_train_map(train_root: str) -> List[Dict]:
     map_path = os.path.join(train_root, "pill_pres_map.json")
     if not os.path.exists(map_path):
-        raise FileNotFoundError(f"Không tìm thấy pill_pres_map.json tại: {map_path}")
+        raise FileNotFoundError(f"Không tìm thấy: {map_path}")
 
     data = load_json(map_path)
     if not isinstance(data, list):
-        raise RuntimeError("pill_pres_map.json của public_train không ở dạng list như mong đợi.")
+        raise RuntimeError("pill_pres_map.json phải ở dạng list")
 
-    cleaned = []
+    rows = []
     for item in data:
         if not isinstance(item, dict):
             continue
+
         pres = item.get("pres")
         pill_list = item.get("pill", [])
 
-        if not pres or not isinstance(pill_list, list):
+        if pres is None or not isinstance(pill_list, list):
             continue
 
-        cleaned.append(
-            {
-                "pres": str(pres),
-                "pres_key": stem_no_ext(pres),
-                "pill_list": [str(x) for x in pill_list],
-                "num_pills": len(pill_list),
-            }
-        )
+        rows.append({
+            "pres": str(pres),
+            "pres_key": stem_no_ext(pres),
+            "pill_list": [str(x) for x in pill_list],
+            "num_pills": len(pill_list),
+        })
 
-    if len(cleaned) == 0:
-        raise RuntimeError("Không đọc được prescription entries nào từ pill_pres_map.json")
+    if len(rows) == 0:
+        raise RuntimeError("Không đọc được prescription nào từ pill_pres_map.json")
 
-    return cleaned
+    return rows
 
 
-def split_prescriptions(
-    prescriptions: List[Dict],
-    seed: int,
-    test_ratio: float,
-    val_ratio_within_trainval: float,
-):
-    if not (0.0 < test_ratio < 1.0):
-        raise ValueError("test_ratio phải nằm trong (0, 1)")
-    if not (0.0 < val_ratio_within_trainval < 1.0):
-        raise ValueError("val_ratio_within_trainval phải nằm trong (0, 1)")
+def build_prescription_label_map(metadata_csv: str) -> Dict[str, Set[int]]:
+    df = pd.read_csv(metadata_csv).copy()
 
-    rng = random.Random(seed)
-    pres_copy = prescriptions.copy()
-    rng.shuffle(pres_copy)
+    required_cols = ["prescription_json", "pill_label"]
+    for c in required_cols:
+        if c not in df.columns:
+            raise RuntimeError(
+                f"{metadata_csv} thiếu cột bắt buộc '{c}'. "
+                f"Các cột hiện có: {df.columns.tolist()}"
+            )
 
-    n_total = len(pres_copy)
-    n_test = max(1, round(n_total * test_ratio))
-    n_trainval = n_total - n_test
-    n_val = max(1, round(n_trainval * val_ratio_within_trainval))
-    n_train = n_total - n_test - n_val
+    df["prescription_key"] = df["prescription_json"].astype(str).apply(stem_no_ext)
+    df["pill_label"] = df["pill_label"].astype(int)
 
-    # đảm bảo không âm
-    if n_train <= 0:
-        raise RuntimeError(
-            f"Số prescriptions quá ít để chia. "
-            f"n_total={n_total}, n_train={n_train}, n_val={n_val}, n_test={n_test}"
-        )
-
-    test_items = pres_copy[:n_test]
-    val_items = pres_copy[n_test:n_test + n_val]
-    train_items = pres_copy[n_test + n_val:]
-
-    return train_items, val_items, test_items
+    grouped = df.groupby("prescription_key")["pill_label"].apply(lambda x: set(x.tolist()))
+    return grouped.to_dict()
 
 
-def summarize_split(name: str, items: List[Dict]) -> Dict:
+def summarize_split(name: str, items: List[Dict], pres_to_labels: Dict[str, Set[int]]) -> Dict:
+    label_union = set()
+    for x in items:
+        label_union.update(pres_to_labels.get(x["pres_key"], set()))
+
     return {
         "split": name,
         "num_prescriptions": len(items),
         "num_pills": int(sum(x["num_pills"] for x in items)),
+        "num_classes": len(label_union),
         "avg_pills_per_prescription": round(
             float(sum(x["num_pills"] for x in items) / len(items)), 4
         ) if len(items) > 0 else 0.0,
@@ -111,124 +96,171 @@ def save_txt(items: List[Dict], out_path: str):
 def save_csv(items: List[Dict], split_name: str, out_path: str):
     rows = []
     for x in items:
-        rows.append(
-            {
+        rows.append({
+            "split": split_name,
+            "prescription_json": x["pres"],
+            "prescription_key": x["pres_key"],
+            "num_pills": x["num_pills"],
+            "pill_json_list": "|".join(x["pill_list"]),
+        })
+    pd.DataFrame(rows).to_csv(out_path, index=False, encoding="utf-8")
+
+
+def try_one_split(
+    prescriptions: List[Dict],
+    pres_to_labels: Dict[str, Set[int]],
+    seed: int,
+    test_ratio: float,
+    val_ratio_within_trainval: float,
+):
+    rng = random.Random(seed)
+    items = prescriptions.copy()
+    rng.shuffle(items)
+
+    n_total = len(items)
+    n_test = max(1, round(n_total * test_ratio))
+    n_trainval = n_total - n_test
+    n_val = max(1, round(n_trainval * val_ratio_within_trainval))
+    n_train = n_total - n_test - n_val
+
+    if n_train <= 0:
+        raise RuntimeError(
+            f"Split không hợp lệ: n_total={n_total}, n_train={n_train}, n_val={n_val}, n_test={n_test}"
+        )
+
+    test_items = items[:n_test]
+    val_items = items[n_test:n_test + n_val]
+    train_items = items[n_test + n_val:]
+
+    train_labels = set()
+    val_labels = set()
+    test_labels = set()
+
+    for x in train_items:
+        train_labels.update(pres_to_labels.get(x["pres_key"], set()))
+    for x in val_items:
+        val_labels.update(pres_to_labels.get(x["pres_key"], set()))
+    for x in test_items:
+        test_labels.update(pres_to_labels.get(x["pres_key"], set()))
+
+    missing_val = sorted(list(val_labels - train_labels))
+    missing_test = sorted(list(test_labels - train_labels))
+
+    ok = (len(missing_val) == 0 and len(missing_test) == 0)
+
+    return {
+        "ok": ok,
+        "seed": seed,
+        "train_items": train_items,
+        "val_items": val_items,
+        "test_items": test_items,
+        "train_labels": train_labels,
+        "val_labels": val_labels,
+        "test_labels": test_labels,
+        "missing_val": missing_val,
+        "missing_test": missing_test,
+    }
+
+
+def main(args):
+    ensure_dir(args.output_dir)
+
+    prescriptions_all = load_public_train_map(args.train_root)
+    pres_to_labels = build_prescription_label_map(args.metadata_csv)
+
+    # chỉ giữ prescriptions có mặt trong metadata
+    prescriptions = [x for x in prescriptions_all if x["pres_key"] in pres_to_labels]
+
+    print("Total prescriptions in pill_pres_map:", len(prescriptions_all))
+    print("Prescriptions found in metadata    :", len(prescriptions))
+    print("Total pill refs in usable split    :", sum(x["num_pills"] for x in prescriptions))
+
+    if len(prescriptions) == 0:
+        raise RuntimeError("Không có prescription nào giao nhau giữa pill_pres_map và metadata.")
+
+    best = None
+    for seed in range(args.seed_start, args.seed_start + args.max_seed_search):
+        result = try_one_split(
+            prescriptions=prescriptions,
+            pres_to_labels=pres_to_labels,
+            seed=seed,
+            test_ratio=args.test_ratio,
+            val_ratio_within_trainval=args.val_ratio_within_trainval,
+        )
+
+        if result["ok"]:
+            best = result
+            break
+
+    if best is None:
+        raise RuntimeError(
+            f"Không tìm thấy split hợp lệ trong khoảng seed "
+            f"{args.seed_start} .. {args.seed_start + args.max_seed_search - 1}"
+        )
+
+    train_items = best["train_items"]
+    val_items = best["val_items"]
+    test_items = best["test_items"]
+
+    print("\nFound valid seed:", best["seed"])
+    print("Train classes:", len(best["train_labels"]))
+    print("Val classes  :", len(best["val_labels"]))
+    print("Test classes :", len(best["test_labels"]))
+    print("Missing val labels in train :", best["missing_val"])
+    print("Missing test labels in train:", best["missing_test"])
+
+    save_txt(train_items, os.path.join(args.output_dir, "train_prescriptions.txt"))
+    save_txt(val_items, os.path.join(args.output_dir, "val_prescriptions.txt"))
+    save_txt(test_items, os.path.join(args.output_dir, "test_prescriptions.txt"))
+
+    save_csv(train_items, "train", os.path.join(args.output_dir, "train_prescriptions.csv"))
+    save_csv(val_items, "val", os.path.join(args.output_dir, "val_prescriptions.csv"))
+    save_csv(test_items, "test", os.path.join(args.output_dir, "test_prescriptions.csv"))
+
+    all_rows = []
+    for split_name, items in [("train", train_items), ("val", val_items), ("test", test_items)]:
+        for x in items:
+            all_rows.append({
                 "split": split_name,
                 "prescription_json": x["pres"],
                 "prescription_key": x["pres_key"],
                 "num_pills": x["num_pills"],
-                "pill_json_list": "|".join(x["pill_list"]),
-            }
-        )
-    pd.DataFrame(rows).to_csv(out_path, index=False, encoding="utf-8")
-
-
-def main(args):
-    train_root = args.train_root
-    out_dir = args.output_dir
-
-    ensure_dir(out_dir)
-
-    prescriptions = load_public_train_map(train_root)
-
-    print("Total prescriptions found:", len(prescriptions))
-    print("Total pill references:", sum(x["num_pills"] for x in prescriptions))
-
-    train_items, val_items, test_items = split_prescriptions(
-        prescriptions=prescriptions,
-        seed=args.seed,
-        test_ratio=args.test_ratio,
-        val_ratio_within_trainval=args.val_ratio_within_trainval,
-    )
-
-    # save txt
-    save_txt(train_items, os.path.join(out_dir, "train_prescriptions.txt"))
-    save_txt(val_items, os.path.join(out_dir, "val_prescriptions.txt"))
-    save_txt(test_items, os.path.join(out_dir, "test_prescriptions.txt"))
-
-    # save per-split csv
-    save_csv(train_items, "train", os.path.join(out_dir, "train_prescriptions.csv"))
-    save_csv(val_items, "val", os.path.join(out_dir, "val_prescriptions.csv"))
-    save_csv(test_items, "test", os.path.join(out_dir, "test_prescriptions.csv"))
-
-    # save combined split map
-    all_rows = []
-    for split_name, items in [
-        ("train", train_items),
-        ("val", val_items),
-        ("test", test_items),
-    ]:
-        for x in items:
-            all_rows.append(
-                {
-                    "split": split_name,
-                    "prescription_json": x["pres"],
-                    "prescription_key": x["pres_key"],
-                    "num_pills": x["num_pills"],
-                }
-            )
+            })
 
     split_map_df = pd.DataFrame(all_rows)
-    split_map_path = os.path.join(out_dir, "prescription_split_map.csv")
-    split_map_df.to_csv(split_map_path, index=False, encoding="utf-8")
+    split_map_df.to_csv(
+        os.path.join(args.output_dir, "prescription_split_map.csv"),
+        index=False,
+        encoding="utf-8",
+    )
 
-    # save summary
-    summary_rows = [
-        summarize_split("train", train_items),
-        summarize_split("val", val_items),
-        summarize_split("test", test_items),
-    ]
-    summary_df = pd.DataFrame(summary_rows)
-    summary_path = os.path.join(out_dir, "split_summary.csv")
-    summary_df.to_csv(summary_path, index=False, encoding="utf-8")
+    summary_df = pd.DataFrame([
+        summarize_split("train", train_items, pres_to_labels),
+        summarize_split("val", val_items, pres_to_labels),
+        summarize_split("test", test_items, pres_to_labels),
+    ])
+    summary_df.to_csv(
+        os.path.join(args.output_dir, "split_summary.csv"),
+        index=False,
+        encoding="utf-8",
+    )
 
     print("\n=== SPLIT SUMMARY ===")
     print(summary_df.to_string(index=False))
 
-    print("\nSaved files:")
-    print("-", os.path.join(out_dir, "train_prescriptions.txt"))
-    print("-", os.path.join(out_dir, "val_prescriptions.txt"))
-    print("-", os.path.join(out_dir, "test_prescriptions.txt"))
-    print("-", os.path.join(out_dir, "train_prescriptions.csv"))
-    print("-", os.path.join(out_dir, "val_prescriptions.csv"))
-    print("-", os.path.join(out_dir, "test_prescriptions.csv"))
-    print("-", split_map_path)
-    print("-", summary_path)
+    print("\nSaved files to:", args.output_dir)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Create prescription-level train/val/test split from public_train"
+        description="Create prescription-level train/val/test split with label coverage check"
     )
-    parser.add_argument(
-        "--train_root",
-        type=str,
-        required=True,
-        help="Path tới public_train",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="splits_prescription_level",
-        help="Thư mục lưu split files",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed",
-    )
-    parser.add_argument(
-        "--test_ratio",
-        type=float,
-        default=52 / 168,
-        help="Tỉ lệ test theo prescription, mặc định gần bài báo PIKA",
-    )
-    parser.add_argument(
-        "--val_ratio_within_trainval",
-        type=float,
-        default=0.203,
-        help="Tỉ lệ val trong phần train+val còn lại",
-    )
+    parser.add_argument("--train_root", type=str, required=True, help="Path tới public_train")
+    parser.add_argument("--metadata_csv", type=str, required=True, help="Metadata CSV có cột prescription_json và pill_label")
+    parser.add_argument("--output_dir", type=str, required=True, help="Thư mục lưu split")
+    parser.add_argument("--seed_start", type=int, default=0, help="Seed bắt đầu tìm kiếm")
+    parser.add_argument("--max_seed_search", type=int, default=5000, help="Số seed sẽ thử")
+    parser.add_argument("--test_ratio", type=float, default=52/168, help="Tỉ lệ test theo prescriptions")
+    parser.add_argument("--val_ratio_within_trainval", type=float, default=0.203, help="Tỉ lệ val trong phần train+val")
     args = parser.parse_args()
     main(args)

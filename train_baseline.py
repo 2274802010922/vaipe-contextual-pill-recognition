@@ -1,294 +1,437 @@
 import os
+import json
+import argparse
 import random
-from collections import Counter
-from pathlib import Path
+from typing import Dict, Optional
 
 import numpy as np
+import pandas as pd
 from PIL import Image, ImageFile
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, accuracy_score, classification_report
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
+from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
+
 import timm
-from tqdm import tqdm
+
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
-DATA_DIR = "/content/processed_pill_cls"
-IMAGE_SIZE = 224
-BATCH_SIZE = 32
-EPOCHS = 10
-LR = 3e-4
-WEIGHT_DECAY = 1e-4
-NUM_WORKERS = 2
-SEED = 42
-MODEL_NAME = "tf_efficientnetv2_s.in21k_ft_in1k"
-OUTPUT_DIR = "./outputs"
-
-
-def seed_everything(seed=42):
+def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
-def ensure_dir(path):
-    os.makedirs(path, exist_ok=True)
+def find_image_column(df: pd.DataFrame, user_col: Optional[str] = None) -> str:
+    if user_col is not None and user_col != "":
+        if user_col not in df.columns:
+            raise RuntimeError(
+                f"Không tìm thấy image column '{user_col}'. "
+                f"Các cột hiện có: {df.columns.tolist()}"
+            )
+        return user_col
 
+    candidates = [
+        "pill_crop_path",
+        "crop_path",
+        "pill_image_path",
+        "image_path",
+        "pill_image",
+        "image",
+    ]
 
-def get_device():
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    for c in candidates:
+        if c in df.columns:
+            return c
 
-
-def build_file_list(data_dir):
-    data_dir = Path(data_dir)
-    class_dirs = sorted(
-        [d for d in data_dir.iterdir() if d.is_dir()],
-        key=lambda x: int(x.name)
+    raise RuntimeError(
+        "Không tự tìm được cột ảnh. "
+        f"Các cột hiện có: {df.columns.tolist()}\n"
+        "Hãy truyền thêm --image_col tên_cột_ảnh."
     )
 
-    samples = []
-    class_names = []
-    class_to_idx = {}
 
-    for idx, class_dir in enumerate(class_dirs):
-        original_class_id = int(class_dir.name)
-        class_names.append(str(original_class_id))
-        class_to_idx[original_class_id] = idx
+def resolve_image_path(path_value: str, image_root: Optional[str] = None) -> str:
+    path_value = str(path_value)
 
-    for class_dir in class_dirs:
-        original_class_id = int(class_dir.name)
-        mapped_label = class_to_idx[original_class_id]
-        for img_path in class_dir.glob("*.jpg"):
-            samples.append((str(img_path), mapped_label))
+    if os.path.isabs(path_value):
+        return path_value
 
-    return samples, class_names
+    if image_root is not None and image_root != "":
+        return os.path.join(image_root, path_value)
+
+    return path_value
 
 
-class PillDataset(Dataset):
-    def __init__(self, samples, transform=None):
-        self.samples = samples
+def get_train_transform(image_size: int = 224):
+    # Theo hướng paper PIKA: resize 224, random rotation 10 độ, horizontal flip.
+    # Không dùng ColorJitter để bám paper sát hơn.
+    return transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.RandomRotation(10),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        ),
+    ])
+
+
+def get_eval_transform(image_size: int = 224):
+    # Val không augmentation.
+    return transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        ),
+    ])
+
+
+class PillBaselineDataset(Dataset):
+    def __init__(
+        self,
+        csv_path: str,
+        label_to_idx: Dict[int, int],
+        transform,
+        image_col: Optional[str] = None,
+        image_root: Optional[str] = None,
+    ):
+        self.csv_path = csv_path
+        self.df = pd.read_csv(csv_path).copy()
         self.transform = transform
+        self.label_to_idx = label_to_idx
+        self.image_root = image_root
+
+        if "pill_label" not in self.df.columns:
+            raise RuntimeError(
+                f"{csv_path} thiếu cột 'pill_label'. "
+                f"Các cột hiện có: {self.df.columns.tolist()}"
+            )
+
+        self.image_col = find_image_column(self.df, image_col)
+
+        self.df["pill_label"] = self.df["pill_label"].astype(int)
+        self.df["image_path_resolved"] = self.df[self.image_col].astype(str).apply(
+            lambda x: resolve_image_path(x, self.image_root)
+        )
+
+        before = len(self.df)
+        self.df = self.df[self.df["image_path_resolved"].apply(os.path.exists)].copy()
+        after = len(self.df)
+
+        if after < before:
+            print(f"[Warning] {csv_path}: bỏ {before - after} dòng vì image path không tồn tại.")
+
+        self.df["label_idx"] = self.df["pill_label"].map(self.label_to_idx)
+
+        missing_label = self.df["label_idx"].isna().sum()
+        if missing_label > 0:
+            print(f"[Warning] {csv_path}: bỏ {missing_label} dòng vì label không có trong label_to_idx.")
+            self.df = self.df[self.df["label_idx"].notna()].copy()
+
+        self.df["label_idx"] = self.df["label_idx"].astype(int)
+        self.df.reset_index(drop=True, inplace=True)
+
+        if len(self.df) == 0:
+            raise RuntimeError(f"Dataset rỗng sau khi lọc: {csv_path}")
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.df)
 
-    def __getitem__(self, idx):
-        img_path, label = self.samples[idx]
-        image = Image.open(img_path).convert("RGB")
-        if self.transform:
-            image = self.transform(image)
-        return image, label
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[idx]
+        img_path = row["image_path_resolved"]
+        label = int(row["label_idx"])
+
+        img = Image.open(img_path).convert("RGB")
+        img = self.transform(img)
+
+        return img, label
 
 
-def build_transforms(image_size=224):
-    train_tfms = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(10),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        ),
-    ])
+def build_label_mapping(train_csv: str, val_csv: str, test_csv: Optional[str] = None):
+    dfs = [pd.read_csv(train_csv), pd.read_csv(val_csv)]
 
-    val_tfms = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        ),
-    ])
+    if test_csv is not None and test_csv != "" and os.path.exists(test_csv):
+        dfs.append(pd.read_csv(test_csv))
 
-    return train_tfms, val_tfms
+    full_df = pd.concat(dfs, ignore_index=True)
+
+    if "pill_label" not in full_df.columns:
+        raise RuntimeError("Metadata thiếu cột pill_label.")
+
+    labels = sorted(full_df["pill_label"].astype(int).unique().tolist())
+
+    label_to_idx = {label: idx for idx, label in enumerate(labels)}
+    idx_to_label = {idx: label for label, idx in label_to_idx.items()}
+
+    return label_to_idx, idx_to_label
 
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
-    running_loss = 0.0
-    all_preds, all_labels = [], []
 
-    pbar = tqdm(loader, desc="Training", leave=False)
-    for images, labels in pbar:
+    total_loss = 0.0
+    all_preds = []
+    all_targets = []
+
+    for images, targets in loader:
         images = images.to(device)
-        labels = labels.to(device)
+        targets = targets.to(device)
 
         optimizer.zero_grad()
+
         outputs = model(images)
-        loss = criterion(outputs, labels)
+        loss = criterion(outputs, targets)
+
         loss.backward()
         optimizer.step()
 
-        running_loss += loss.item() * images.size(0)
+        total_loss += loss.item() * images.size(0)
+
         preds = outputs.argmax(dim=1)
+        all_preds.extend(preds.detach().cpu().numpy().tolist())
+        all_targets.extend(targets.detach().cpu().numpy().tolist())
 
-        all_preds.extend(preds.detach().cpu().numpy())
-        all_labels.extend(labels.detach().cpu().numpy())
+    avg_loss = total_loss / max(1, len(loader.dataset))
+    acc = accuracy_score(all_targets, all_preds)
+    macro_f1 = f1_score(all_targets, all_preds, average="macro", zero_division=0)
 
-    epoch_loss = running_loss / len(loader.dataset)
-    epoch_acc = accuracy_score(all_labels, all_preds)
-    epoch_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
-
-    return epoch_loss, epoch_acc, epoch_f1
+    return avg_loss, acc, macro_f1
 
 
 @torch.no_grad()
-def validate_one_epoch(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device):
     model.eval()
-    running_loss = 0.0
-    all_preds, all_labels = [], []
 
-    pbar = tqdm(loader, desc="Validation", leave=False)
-    for images, labels in pbar:
+    total_loss = 0.0
+    all_preds = []
+    all_targets = []
+
+    for images, targets in loader:
         images = images.to(device)
-        labels = labels.to(device)
+        targets = targets.to(device)
 
         outputs = model(images)
-        loss = criterion(outputs, labels)
+        loss = criterion(outputs, targets)
 
-        running_loss += loss.item() * images.size(0)
+        total_loss += loss.item() * images.size(0)
+
         preds = outputs.argmax(dim=1)
+        all_preds.extend(preds.detach().cpu().numpy().tolist())
+        all_targets.extend(targets.detach().cpu().numpy().tolist())
 
-        all_preds.extend(preds.detach().cpu().numpy())
-        all_labels.extend(labels.detach().cpu().numpy())
+    avg_loss = total_loss / max(1, len(loader.dataset))
+    acc = accuracy_score(all_targets, all_preds)
+    macro_f1 = f1_score(all_targets, all_preds, average="macro", zero_division=0)
 
-    epoch_loss = running_loss / len(loader.dataset)
-    epoch_acc = accuracy_score(all_labels, all_preds)
-    epoch_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
-
-    return epoch_loss, epoch_acc, epoch_f1, all_labels, all_preds
-
-
-def main():
-    seed_everything(SEED)
-    ensure_dir(OUTPUT_DIR)
-
-    device = get_device()
-    print("Using device:", device)
-
-    samples, class_names = build_file_list(DATA_DIR)
-    print("Total cropped samples:", len(samples))
-    print("Total classes:", len(class_names))
-
-    labels = [label for _, label in samples]
-
-    label_counts = Counter(labels)
-    valid_labels = sorted([label for label, count in label_counts.items() if count >= 2])
-
-    samples = [(path, label) for path, label in samples if label in set(valid_labels)]
-
-    # Remap labels to contiguous range: 0..num_classes-1
-    old_to_new = {old_label: new_label for new_label, old_label in enumerate(valid_labels)}
-    samples = [(path, old_to_new[label]) for path, label in samples]
-
-    labels = [label for _, label in samples]
-
-    print("Samples after filtering rare classes:", len(samples))
-    print("Usable classes:", len(set(labels)))
-    print("Min label after remap:", min(labels))
-    print("Max label after remap:", max(labels))
-
-    train_samples, val_samples = train_test_split(
-        samples,
-        test_size=0.2,
-        random_state=SEED,
-        stratify=labels
+    precision, recall, _, _ = precision_recall_fscore_support(
+        all_targets,
+        all_preds,
+        average="macro",
+        zero_division=0,
     )
 
-    print("Train samples:", len(train_samples))
-    print("Val samples:", len(val_samples))
+    return avg_loss, acc, precision, recall, macro_f1
 
-    train_tfms, val_tfms = build_transforms(IMAGE_SIZE)
-    train_dataset = PillDataset(train_samples, transform=train_tfms)
-    val_dataset = PillDataset(val_samples, transform=val_tfms)
+
+def main(args):
+    set_seed(args.seed)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
+    print("Train CSV:", args.train_csv)
+    print("Val CSV  :", args.val_csv)
+    if args.test_csv:
+        print("Test CSV :", args.test_csv)
+
+    label_to_idx, idx_to_label = build_label_mapping(
+        train_csv=args.train_csv,
+        val_csv=args.val_csv,
+        test_csv=args.test_csv,
+    )
+
+    num_classes = len(label_to_idx)
+    print("Num classes:", num_classes)
+
+    with open(os.path.join(args.output_dir, "label_to_idx.json"), "w", encoding="utf-8") as f:
+        json.dump({str(k): int(v) for k, v in label_to_idx.items()}, f, ensure_ascii=False, indent=2)
+
+    with open(os.path.join(args.output_dir, "idx_to_label.json"), "w", encoding="utf-8") as f:
+        json.dump({str(k): int(v) for k, v in idx_to_label.items()}, f, ensure_ascii=False, indent=2)
+
+    train_dataset = PillBaselineDataset(
+        csv_path=args.train_csv,
+        label_to_idx=label_to_idx,
+        transform=get_train_transform(args.image_size),
+        image_col=args.image_col,
+        image_root=args.image_root,
+    )
+
+    val_dataset = PillBaselineDataset(
+        csv_path=args.val_csv,
+        label_to_idx=label_to_idx,
+        transform=get_eval_transform(args.image_size),
+        image_col=args.image_col,
+        image_root=args.image_root,
+    )
+
+    print("Train samples:", len(train_dataset))
+    print("Val samples  :", len(val_dataset))
+    print("Image column :", train_dataset.image_col)
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=args.batch_size,
         shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=True
+        num_workers=args.num_workers,
+        pin_memory=True,
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=args.batch_size,
         shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=True
+        num_workers=args.num_workers,
+        pin_memory=True,
     )
 
-    num_classes = len(set(labels))
     model = timm.create_model(
-        MODEL_NAME,
-        pretrained=True,
-        num_classes=num_classes
-    ).to(device)
+        args.model_name,
+        pretrained=args.pretrained,
+        num_classes=num_classes,
+    )
+    model = model.to(device)
 
-    train_label_counts = Counter([label for _, label in train_samples])
-    class_weights = []
+    criterion = nn.CrossEntropyLoss()
 
-    for class_id in range(num_classes):
-        count = train_label_counts.get(class_id, 1)
-        class_weights.append(1.0 / count)
-
-    class_weights = torch.tensor(class_weights, dtype=torch.float32)
-    class_weights = class_weights / class_weights.sum() * num_classes
-    class_weights = class_weights.to(device)
-
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=LR,
-        weight_decay=WEIGHT_DECAY
+        lr=args.lr,
+        weight_decay=args.weight_decay,
     )
 
-    best_f1 = 0.0
-    best_labels, best_preds = None, None
+    best_val_f1 = -1.0
+    history = []
 
-    for epoch in range(EPOCHS):
-        print(f"\nEpoch [{epoch+1}/{EPOCHS}]")
+    best_path = os.path.join(args.output_dir, args.best_name)
+    last_path = os.path.join(args.output_dir, args.last_name)
+
+    for epoch in range(1, args.epochs + 1):
+        print(f"\nEpoch [{epoch}/{args.epochs}]")
 
         train_loss, train_acc, train_f1 = train_one_epoch(
-            model, train_loader, criterion, optimizer, device
+            model=model,
+            loader=train_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            device=device,
         )
 
-        val_loss, val_acc, val_f1, val_labels, val_preds = validate_one_epoch(
-            model, val_loader, criterion, device
+        val_loss, val_acc, val_precision, val_recall, val_f1 = evaluate(
+            model=model,
+            loader=val_loader,
+            criterion=criterion,
+            device=device,
         )
 
-        print(
-            f"Train Loss: {train_loss:.4f} | "
-            f"Train Acc: {train_acc:.4f} | "
-            f"Train Macro F1: {train_f1:.4f}"
+        row = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "train_macro_f1": train_f1,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+            "val_macro_precision": val_precision,
+            "val_macro_recall": val_recall,
+            "val_macro_f1": val_f1,
+        }
+        history.append(row)
+
+        print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Train Macro F1: {train_f1:.4f}")
+        print(f"Val   Loss: {val_loss:.4f} | Val   Acc: {val_acc:.4f} | Val   Macro F1: {val_f1:.4f}")
+
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "num_classes": num_classes,
+                "model_name": args.model_name,
+                "label_to_idx": label_to_idx,
+                "idx_to_label": idx_to_label,
+                "val_macro_f1": val_f1,
+                "val_acc": val_acc,
+            },
+            last_path,
         )
-        print(
-            f"Val   Loss: {val_loss:.4f} | "
-            f"Val   Acc: {val_acc:.4f} | "
-            f"Val   Macro F1: {val_f1:.4f}"
-        )
 
-        if val_f1 > best_f1:
-            best_f1 = val_f1
-            best_labels, best_preds = val_labels, val_preds
-            torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "best_model.pth"))
-            print(f"Saved best model with Val Macro F1 = {best_f1:.4f}")
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
 
-    print("\nBest Val Macro F1:", round(best_f1, 4))
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "num_classes": num_classes,
+                    "model_name": args.model_name,
+                    "label_to_idx": label_to_idx,
+                    "idx_to_label": idx_to_label,
+                    "val_macro_f1": val_f1,
+                    "val_acc": val_acc,
+                },
+                best_path,
+            )
 
-    if best_labels is not None and best_preds is not None:
-        print("\nClassification report on best validation set:")
-        print(classification_report(best_labels, best_preds, digits=4, zero_division=0))
+            print(f"Saved best checkpoint: {best_path}")
+            print(f"Best Val Macro F1: {best_val_f1:.4f}")
+
+        history_df = pd.DataFrame(history)
+        history_df.to_csv(os.path.join(args.output_dir, "train_history.csv"), index=False)
+
+    print("\nTraining done.")
+    print("Best checkpoint:", best_path)
+    print("Best Val Macro F1:", best_val_f1)
+    print("Last checkpoint:", last_path)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Train M1 baseline using predefined train/val split CSV")
+
+    parser.add_argument("--train_csv", type=str, required=True)
+    parser.add_argument("--val_csv", type=str, required=True)
+    parser.add_argument("--test_csv", type=str, default="")
+
+    parser.add_argument("--output_dir", type=str, default="/content/drive/MyDrive/model/M1_split_baseline")
+    parser.add_argument("--best_name", type=str, default="M1_baseline_split_best.pth")
+    parser.add_argument("--last_name", type=str, default="M1_baseline_split_last.pth")
+
+    parser.add_argument("--image_col", type=str, default="")
+    parser.add_argument("--image_root", type=str, default="")
+
+    parser.add_argument("--model_name", type=str, default="resnet18")
+    parser.add_argument("--pretrained", action="store_true")
+
+    parser.add_argument("--image_size", type=int, default=224)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--num_workers", type=int, default=2)
+
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+
+    parser.add_argument("--seed", type=int, default=42)
+
+    args = parser.parse_args()
+    main(args)

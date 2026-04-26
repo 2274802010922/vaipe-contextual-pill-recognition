@@ -2,8 +2,9 @@ import os
 import json
 import random
 import argparse
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 
+import numpy as np
 import pandas as pd
 
 
@@ -27,7 +28,7 @@ def load_public_train_map(train_root: str) -> List[Dict]:
 
     data = load_json(map_path)
     if not isinstance(data, list):
-        raise RuntimeError("pill_pres_map.json phải ở dạng list")
+        raise RuntimeError("pill_pres_map.json phải ở dạng list.")
 
     rows = []
     for item in data:
@@ -48,7 +49,7 @@ def load_public_train_map(train_root: str) -> List[Dict]:
         })
 
     if len(rows) == 0:
-        raise RuntimeError("Không đọc được prescription nào từ pill_pres_map.json")
+        raise RuntimeError("Không đọc được prescription nào từ pill_pres_map.json.")
 
     return rows
 
@@ -60,7 +61,7 @@ def build_prescription_label_map(metadata_csv: str) -> Dict[str, Set[int]]:
     for c in required_cols:
         if c not in df.columns:
             raise RuntimeError(
-                f"{metadata_csv} thiếu cột bắt buộc '{c}'. "
+                f"{metadata_csv} thiếu cột '{c}'. "
                 f"Các cột hiện có: {df.columns.tolist()}"
             )
 
@@ -71,31 +72,134 @@ def build_prescription_label_map(metadata_csv: str) -> Dict[str, Set[int]]:
     return grouped.to_dict()
 
 
-def summarize_split(name: str, items: List[Dict], pres_to_labels: Dict[str, Set[int]]) -> Dict:
-    label_union = set()
-    for x in items:
-        label_union.update(pres_to_labels.get(x["pres_key"], set()))
+def build_label_to_prescriptions(pres_to_labels: Dict[str, Set[int]]) -> Dict[int, Set[str]]:
+    label_to_pres = {}
+    for pres_key, labels in pres_to_labels.items():
+        for label in labels:
+            label_to_pres.setdefault(label, set()).add(pres_key)
+    return label_to_pres
+
+
+def multilabel_matrix(keys: List[str], pres_to_labels: Dict[str, Set[int]], label_list: List[int]):
+    label_to_col = {label: i for i, label in enumerate(label_list)}
+    y = np.zeros((len(keys), len(label_list)), dtype=int)
+
+    for i, key in enumerate(keys):
+        for label in pres_to_labels.get(key, set()):
+            if label in label_to_col:
+                y[i, label_to_col[label]] = 1
+
+    return y
+
+
+def iterative_split_indices(keys: List[str], y: np.ndarray, test_size: float):
+    try:
+        from skmultilearn.model_selection import iterative_train_test_split
+    except ImportError as e:
+        raise ImportError(
+            "Thiếu thư viện scikit-multilearn. "
+            "Cài trong Colab bằng: !pip install scikit-multilearn"
+        ) from e
+
+    if len(keys) == 0:
+        return [], []
+
+    if test_size <= 0:
+        return keys, []
+
+    if test_size >= 1:
+        return [], keys
+
+    x = np.arange(len(keys)).reshape(-1, 1)
+
+    x_train, y_train, x_test, y_test = iterative_train_test_split(
+        x,
+        y,
+        test_size=test_size,
+    )
+
+    train_indices = x_train.reshape(-1).astype(int).tolist()
+    test_indices = x_test.reshape(-1).astype(int).tolist()
+
+    train_keys = [keys[i] for i in train_indices]
+    test_keys = [keys[i] for i in test_indices]
+
+    return train_keys, test_keys
+
+
+def label_union(keys: Set[str], pres_to_labels: Dict[str, Set[int]]) -> Set[int]:
+    labels = set()
+    for key in keys:
+        labels.update(pres_to_labels.get(key, set()))
+    return labels
+
+
+def repair_unseen_labels(
+    train_keys: Set[str],
+    val_keys: Set[str],
+    test_keys: Set[str],
+    pres_to_labels: Dict[str, Set[int]],
+):
+    """
+    Nếu val/test có nhãn mà train chưa có, dời prescription chứa nhãn đó sang train.
+    Vẫn bảo đảm không chồng chéo vì prescription bị remove khỏi val/test trước khi thêm vào train.
+    """
+    changed = True
+
+    while changed:
+        changed = False
+
+        train_labels = label_union(train_keys, pres_to_labels)
+        val_labels = label_union(val_keys, pres_to_labels)
+        test_labels = label_union(test_keys, pres_to_labels)
+
+        missing_val = sorted(list(val_labels - train_labels))
+        missing_test = sorted(list(test_labels - train_labels))
+
+        for label in missing_val:
+            candidates = [k for k in val_keys if label in pres_to_labels.get(k, set())]
+            if len(candidates) > 0:
+                move_key = sorted(candidates)[0]
+                val_keys.remove(move_key)
+                train_keys.add(move_key)
+                changed = True
+
+        train_labels = label_union(train_keys, pres_to_labels)
+
+        for label in missing_test:
+            candidates = [k for k in test_keys if label in pres_to_labels.get(k, set())]
+            if len(candidates) > 0:
+                move_key = sorted(candidates)[0]
+                test_keys.remove(move_key)
+                train_keys.add(move_key)
+                changed = True
+
+    return train_keys, val_keys, test_keys
+
+
+def summarize_split(name: str, keys: Set[str], pres_lookup: Dict[str, Dict], pres_to_labels: Dict[str, Set[int]]) -> Dict:
+    labels = label_union(keys, pres_to_labels)
+    num_pills = sum(pres_lookup[k]["num_pills"] for k in keys)
 
     return {
         "split": name,
-        "num_prescriptions": len(items),
-        "num_pills": int(sum(x["num_pills"] for x in items)),
-        "num_classes": len(label_union),
-        "avg_pills_per_prescription": round(
-            float(sum(x["num_pills"] for x in items) / len(items)), 4
-        ) if len(items) > 0 else 0.0,
+        "num_prescriptions": len(keys),
+        "num_pills": int(num_pills),
+        "num_classes": len(labels),
+        "avg_pills_per_prescription": round(num_pills / len(keys), 4) if len(keys) > 0 else 0.0,
     }
 
 
-def save_txt(items: List[Dict], out_path: str):
+def save_txt(keys: Set[str], out_path: str):
     with open(out_path, "w", encoding="utf-8") as f:
-        for x in items:
-            f.write(f"{x['pres_key']}\n")
+        for key in sorted(keys):
+            f.write(f"{key}\n")
 
 
-def save_csv(items: List[Dict], split_name: str, out_path: str):
+def save_csv(keys: Set[str], split_name: str, pres_lookup: Dict[str, Dict], out_path: str):
     rows = []
-    for x in items:
+    for key in sorted(keys):
+        x = pres_lookup[key]
         rows.append({
             "split": split_name,
             "prescription_json": x["pres"],
@@ -103,123 +207,220 @@ def save_csv(items: List[Dict], split_name: str, out_path: str):
             "num_pills": x["num_pills"],
             "pill_json_list": "|".join(x["pill_list"]),
         })
+
     pd.DataFrame(rows).to_csv(out_path, index=False, encoding="utf-8")
 
 
-def try_one_split(
-    prescriptions: List[Dict],
-    pres_to_labels: Dict[str, Set[int]],
-    seed: int,
-    test_ratio: float,
-    val_ratio_within_trainval: float,
-):
-    rng = random.Random(seed)
-    items = prescriptions.copy()
-    rng.shuffle(items)
+def save_label_frequency(label_to_pres: Dict[int, Set[str]], out_path: str):
+    rows = []
+    for label, pres_set in sorted(label_to_pres.items()):
+        rows.append({
+            "pill_label": label,
+            "num_prescriptions": len(pres_set),
+            "prescription_keys": "|".join(sorted(pres_set)),
+        })
 
-    n_total = len(items)
-    n_test = max(1, round(n_total * test_ratio))
-    n_trainval = n_total - n_test
-    n_val = max(1, round(n_trainval * val_ratio_within_trainval))
-    n_train = n_total - n_test - n_val
-
-    if n_train <= 0:
-        raise RuntimeError(
-            f"Split không hợp lệ: n_total={n_total}, n_train={n_train}, n_val={n_val}, n_test={n_test}"
-        )
-
-    test_items = items[:n_test]
-    val_items = items[n_test:n_test + n_val]
-    train_items = items[n_test + n_val:]
-
-    train_labels = set()
-    val_labels = set()
-    test_labels = set()
-
-    for x in train_items:
-        train_labels.update(pres_to_labels.get(x["pres_key"], set()))
-    for x in val_items:
-        val_labels.update(pres_to_labels.get(x["pres_key"], set()))
-    for x in test_items:
-        test_labels.update(pres_to_labels.get(x["pres_key"], set()))
-
-    missing_val = sorted(list(val_labels - train_labels))
-    missing_test = sorted(list(test_labels - train_labels))
-
-    ok = (len(missing_val) == 0 and len(missing_test) == 0)
-
-    return {
-        "ok": ok,
-        "seed": seed,
-        "train_items": train_items,
-        "val_items": val_items,
-        "test_items": test_items,
-        "train_labels": train_labels,
-        "val_labels": val_labels,
-        "test_labels": test_labels,
-        "missing_val": missing_val,
-        "missing_test": missing_test,
-    }
+    pd.DataFrame(rows).to_csv(out_path, index=False, encoding="utf-8")
 
 
 def main(args):
     ensure_dir(args.output_dir)
 
+    total_ratio = args.train_ratio + args.val_ratio + args.test_ratio
+    train_ratio = args.train_ratio / total_ratio
+    val_ratio = args.val_ratio / total_ratio
+    test_ratio = args.test_ratio / total_ratio
+
+    print("Target ratios:")
+    print(f"train={train_ratio:.4f}, val={val_ratio:.4f}, test={test_ratio:.4f}")
+
     prescriptions_all = load_public_train_map(args.train_root)
     pres_to_labels = build_prescription_label_map(args.metadata_csv)
 
-    # chỉ giữ prescriptions có mặt trong metadata
     prescriptions = [x for x in prescriptions_all if x["pres_key"] in pres_to_labels]
+    pres_lookup = {x["pres_key"]: x for x in prescriptions}
+    all_keys = set(pres_lookup.keys())
 
+    label_to_pres = build_label_to_prescriptions(pres_to_labels)
+    label_list = sorted(label_to_pres.keys())
+
+    print("\nDataset info:")
     print("Total prescriptions in pill_pres_map:", len(prescriptions_all))
     print("Prescriptions found in metadata    :", len(prescriptions))
+    print("Total labels/classes               :", len(label_list))
     print("Total pill refs in usable split    :", sum(x["num_pills"] for x in prescriptions))
 
-    if len(prescriptions) == 0:
-        raise RuntimeError("Không có prescription nào giao nhau giữa pill_pres_map và metadata.")
+    save_label_frequency(
+        label_to_pres,
+        os.path.join(args.output_dir, "label_frequency_by_prescription.csv"),
+    )
 
-    best = None
-    for seed in range(args.seed_start, args.seed_start + args.max_seed_search):
-        result = try_one_split(
-            prescriptions=prescriptions,
-            pres_to_labels=pres_to_labels,
-            seed=seed,
-            test_ratio=args.test_ratio,
-            val_ratio_within_trainval=args.val_ratio_within_trainval,
-        )
+    # 1. Xử lý nhãn hiếm
+    forced_train = set()
+    preferred_test = set()
+    rare_policy_rows = []
 
-        if result["ok"]:
-            best = result
-            break
+    # Nhãn chỉ có 1 prescription: bắt buộc vào train
+    for label, pres_set in label_to_pres.items():
+        if len(pres_set) == 1:
+            key = list(pres_set)[0]
+            forced_train.add(key)
+            rare_policy_rows.append({
+                "pill_label": label,
+                "num_prescriptions": 1,
+                "policy": "force_to_train",
+                "train_prescription": key,
+                "test_prescription": "",
+            })
 
-    if best is None:
+    # Nhãn có 2 prescription: cố gắng 1 train, 1 test
+    for label, pres_set in label_to_pres.items():
+        if len(pres_set) == 2:
+            keys = sorted(list(pres_set))
+
+            already_train = [k for k in keys if k in forced_train]
+
+            if len(already_train) > 0:
+                train_key = already_train[0]
+                test_candidates = [k for k in keys if k != train_key]
+                test_key = test_candidates[0] if len(test_candidates) > 0 else ""
+            else:
+                train_key = keys[0]
+                test_key = keys[1]
+
+            forced_train.add(train_key)
+
+            if test_key and test_key not in forced_train:
+                preferred_test.add(test_key)
+
+            rare_policy_rows.append({
+                "pill_label": label,
+                "num_prescriptions": 2,
+                "policy": "one_to_train_one_to_test_if_possible",
+                "train_prescription": train_key,
+                "test_prescription": test_key,
+            })
+
+    preferred_test = preferred_test - forced_train
+
+    pd.DataFrame(rare_policy_rows).to_csv(
+        os.path.join(args.output_dir, "rare_label_policy.csv"),
+        index=False,
+        encoding="utf-8",
+    )
+
+    print("\nRare label handling:")
+    print("Forced train prescriptions:", len(forced_train))
+    print("Preferred test prescriptions:", len(preferred_test))
+
+    # 2. Chia phần còn lại bằng iterative stratification
+    fixed_keys = forced_train | preferred_test
+    remaining_keys = sorted(list(all_keys - fixed_keys))
+
+    rng = random.Random(args.seed)
+    rng.shuffle(remaining_keys)
+
+    n_total = len(all_keys)
+    target_train = round(n_total * train_ratio)
+    target_val = round(n_total * val_ratio)
+    target_test = n_total - target_train - target_val
+
+    remaining_test_slots = max(0, target_test - len(preferred_test))
+    remaining_val_slots = max(0, target_val)
+
+    print("\nTarget split sizes:")
+    print("target_train:", target_train)
+    print("target_val  :", target_val)
+    print("target_test :", target_test)
+
+    print("\nRemaining split slots:")
+    print("remaining keys       :", len(remaining_keys))
+    print("remaining test slots :", remaining_test_slots)
+    print("remaining val slots  :", remaining_val_slots)
+
+    # split thêm test từ phần còn lại
+    if len(remaining_keys) > 0 and remaining_test_slots > 0:
+        y_remaining = multilabel_matrix(remaining_keys, pres_to_labels, label_list)
+        test_size = min(0.95, remaining_test_slots / len(remaining_keys))
+        pool_keys, add_test_keys = iterative_split_indices(remaining_keys, y_remaining, test_size)
+    else:
+        pool_keys = remaining_keys
+        add_test_keys = []
+
+    # split val từ pool
+    if len(pool_keys) > 0 and remaining_val_slots > 0:
+        y_pool = multilabel_matrix(pool_keys, pres_to_labels, label_list)
+        val_size = min(0.95, remaining_val_slots / len(pool_keys))
+        add_train_keys, val_keys_list = iterative_split_indices(pool_keys, y_pool, val_size)
+    else:
+        add_train_keys = pool_keys
+        val_keys_list = []
+
+    train_keys = set(forced_train) | set(add_train_keys)
+    val_keys = set(val_keys_list)
+    test_keys = set(preferred_test) | set(add_test_keys)
+
+    # 3. Repair: nếu val/test có nhãn chưa có trong train thì dời prescription đó sang train
+    train_keys, val_keys, test_keys = repair_unseen_labels(
+        train_keys=train_keys,
+        val_keys=val_keys,
+        test_keys=test_keys,
+        pres_to_labels=pres_to_labels,
+    )
+
+    # 4. Kiểm tra không chồng chéo
+    overlap_train_val = train_keys & val_keys
+    overlap_train_test = train_keys & test_keys
+    overlap_val_test = val_keys & test_keys
+
+    if overlap_train_val or overlap_train_test or overlap_val_test:
         raise RuntimeError(
-            f"Không tìm thấy split hợp lệ trong khoảng seed "
-            f"{args.seed_start} .. {args.seed_start + args.max_seed_search - 1}"
+            "Split bị chồng chéo. "
+            f"train∩val={len(overlap_train_val)}, "
+            f"train∩test={len(overlap_train_test)}, "
+            f"val∩test={len(overlap_val_test)}"
         )
 
-    train_items = best["train_items"]
-    val_items = best["val_items"]
-    test_items = best["test_items"]
+    # 5. Kiểm tra label coverage
+    train_labels = label_union(train_keys, pres_to_labels)
+    val_labels = label_union(val_keys, pres_to_labels)
+    test_labels = label_union(test_keys, pres_to_labels)
 
-    print("\nFound valid seed:", best["seed"])
-    print("Train classes:", len(best["train_labels"]))
-    print("Val classes  :", len(best["val_labels"]))
-    print("Test classes :", len(best["test_labels"]))
-    print("Missing val labels in train :", best["missing_val"])
-    print("Missing test labels in train:", best["missing_test"])
+    unseen_val = sorted(list(val_labels - train_labels))
+    unseen_test = sorted(list(test_labels - train_labels))
 
-    save_txt(train_items, os.path.join(args.output_dir, "train_prescriptions.txt"))
-    save_txt(val_items, os.path.join(args.output_dir, "val_prescriptions.txt"))
-    save_txt(test_items, os.path.join(args.output_dir, "test_prescriptions.txt"))
+    print("\nFinal label coverage check:")
+    print("Train classes:", len(train_labels))
+    print("Val classes  :", len(val_labels))
+    print("Test classes :", len(test_labels))
+    print("Labels in val but not in train :", unseen_val)
+    print("Labels in test but not in train:", unseen_test)
 
-    save_csv(train_items, "train", os.path.join(args.output_dir, "train_prescriptions.csv"))
-    save_csv(val_items, "val", os.path.join(args.output_dir, "val_prescriptions.csv"))
-    save_csv(test_items, "test", os.path.join(args.output_dir, "test_prescriptions.csv"))
+    if len(unseen_val) > 0 or len(unseen_test) > 0:
+        raise RuntimeError("Vẫn còn nhãn ở val/test nhưng không có trong train.")
+
+    print("\nOverlap check:")
+    print("train∩val :", len(overlap_train_val))
+    print("train∩test:", len(overlap_train_test))
+    print("val∩test  :", len(overlap_val_test))
+
+    # 6. Save files
+    save_txt(train_keys, os.path.join(args.output_dir, "train_prescriptions.txt"))
+    save_txt(val_keys, os.path.join(args.output_dir, "val_prescriptions.txt"))
+    save_txt(test_keys, os.path.join(args.output_dir, "test_prescriptions.txt"))
+
+    save_csv(train_keys, "train", pres_lookup, os.path.join(args.output_dir, "train_prescriptions.csv"))
+    save_csv(val_keys, "val", pres_lookup, os.path.join(args.output_dir, "val_prescriptions.csv"))
+    save_csv(test_keys, "test", pres_lookup, os.path.join(args.output_dir, "test_prescriptions.csv"))
 
     all_rows = []
-    for split_name, items in [("train", train_items), ("val", val_items), ("test", test_items)]:
-        for x in items:
+    for split_name, keys in [
+        ("train", train_keys),
+        ("val", val_keys),
+        ("test", test_keys),
+    ]:
+        for key in sorted(keys):
+            x = pres_lookup[key]
             all_rows.append({
                 "split": split_name,
                 "prescription_json": x["pres"],
@@ -235,9 +436,9 @@ def main(args):
     )
 
     summary_df = pd.DataFrame([
-        summarize_split("train", train_items, pres_to_labels),
-        summarize_split("val", val_items, pres_to_labels),
-        summarize_split("test", test_items, pres_to_labels),
+        summarize_split("train", train_keys, pres_lookup, pres_to_labels),
+        summarize_split("val", val_keys, pres_lookup, pres_to_labels),
+        summarize_split("test", test_keys, pres_lookup, pres_to_labels),
     ])
     summary_df.to_csv(
         os.path.join(args.output_dir, "split_summary.csv"),
@@ -253,14 +454,17 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Create prescription-level train/val/test split with label coverage check"
+        description="Prescription-level train/val/test split with rare-label handling and iterative stratification"
     )
-    parser.add_argument("--train_root", type=str, required=True, help="Path tới public_train")
-    parser.add_argument("--metadata_csv", type=str, required=True, help="Metadata CSV có cột prescription_json và pill_label")
-    parser.add_argument("--output_dir", type=str, required=True, help="Thư mục lưu split")
-    parser.add_argument("--seed_start", type=int, default=0, help="Seed bắt đầu tìm kiếm")
-    parser.add_argument("--max_seed_search", type=int, default=5000, help="Số seed sẽ thử")
-    parser.add_argument("--test_ratio", type=float, default=52/168, help="Tỉ lệ test theo prescriptions")
-    parser.add_argument("--val_ratio_within_trainval", type=float, default=0.203, help="Tỉ lệ val trong phần train+val")
+    parser.add_argument("--train_root", type=str, required=True)
+    parser.add_argument("--metadata_csv", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
+
+    parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument("--train_ratio", type=float, default=0.70)
+    parser.add_argument("--val_ratio", type=float, default=0.15)
+    parser.add_argument("--test_ratio", type=float, default=0.15)
+
     args = parser.parse_args()
     main(args)

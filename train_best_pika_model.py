@@ -2,13 +2,15 @@ import os
 import json
 import math
 import random
+import argparse
 from collections import Counter
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageFile
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, accuracy_score, classification_report
+
+from sklearn.metrics import f1_score, accuracy_score, precision_recall_fscore_support
 
 import torch
 import torch.nn as nn
@@ -18,37 +20,18 @@ from torchvision import transforms
 import timm
 from tqdm import tqdm
 
+
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-DATA_ROOT = os.environ.get("PIKA_BEST_OUTPUT_ROOT", "/content/processed_pika_best")
-CSV_PATH = os.path.join(DATA_ROOT, "best_pika_metadata.csv")
-GRAPH_LABELS_JSON = os.path.join(DATA_ROOT, "graph_labels.json")
-GRAPH_PMI_NPY = os.path.join(DATA_ROOT, "graph_pmi.npy")
 
-IMAGE_SIZE = 224
-BATCH_SIZE = 20
-EPOCHS = 15
-LR = 2e-4
-WEIGHT_DECAY = 1e-4
-NUM_WORKERS = 2
-SEED = 42
-
-PILL_MODEL_NAME = "tf_efficientnetv2_s.in21k_ft_in1k"
-PRES_MODEL_NAME = "resnet18.a1_in1k"
-
-HIDDEN_DIM = 256
-MAX_CONTEXT_LEN = 8
-OUTPUT_DIR = "./outputs_best_pika"
-
-
-def seed_everything(seed=42):
+def seed_everything(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
-def ensure_dir(path):
+def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
 
@@ -56,13 +39,101 @@ def get_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def normalize_adjacency(adj):
+def normalize_adjacency(adj: np.ndarray):
+    adj = adj.astype(np.float32)
     adj = adj + np.eye(adj.shape[0], dtype=np.float32)
     degree = adj.sum(axis=1)
     degree = np.where(degree == 0, 1.0, degree)
     d_inv_sqrt = np.power(degree, -0.5)
     d_mat = np.diag(d_inv_sqrt)
     return d_mat @ adj @ d_mat
+
+
+def load_json(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def build_label_mapping(train_csv: str, val_csv: str, test_csv: Optional[str] = None):
+    dfs = [pd.read_csv(train_csv), pd.read_csv(val_csv)]
+
+    if test_csv is not None and test_csv != "" and os.path.exists(test_csv):
+        dfs.append(pd.read_csv(test_csv))
+
+    full_df = pd.concat(dfs, ignore_index=True)
+
+    if "pill_label" not in full_df.columns:
+        raise RuntimeError("Metadata thiếu cột pill_label.")
+
+    labels = sorted(full_df["pill_label"].astype(int).unique().tolist())
+
+    label_to_idx = {label: idx for idx, label in enumerate(labels)}
+    idx_to_label = {idx: label for label, idx in label_to_idx.items()}
+
+    return label_to_idx, idx_to_label
+
+
+def add_mapped_columns(df: pd.DataFrame, label_to_idx: Dict[int, int]) -> pd.DataFrame:
+    df = df.copy()
+
+    required_cols = [
+        "pill_crop_path",
+        "prescription_image_path",
+        "pill_label",
+        "context_labels",
+    ]
+    for c in required_cols:
+        if c not in df.columns:
+            raise RuntimeError(
+                f"Metadata thiếu cột '{c}'. Các cột hiện có: {df.columns.tolist()}"
+            )
+
+    df["pill_label"] = df["pill_label"].astype(int)
+    df["mapped_label"] = df["pill_label"].map(label_to_idx)
+
+    missing = df["mapped_label"].isna().sum()
+    if missing > 0:
+        print(f"[Warning] Bỏ {missing} dòng vì pill_label không có trong label_to_idx.")
+        df = df[df["mapped_label"].notna()].copy()
+
+    df["mapped_label"] = df["mapped_label"].astype(int)
+
+    def remap_context(s):
+        try:
+            vals = json.loads(s)
+        except Exception:
+            vals = []
+
+        mapped = []
+        for v in vals:
+            v = int(v)
+            if v in label_to_idx:
+                mapped.append(int(label_to_idx[v]))
+
+        mapped = sorted(list(set(mapped)))
+        return json.dumps(mapped)
+
+    df["context_labels_mapped"] = df["context_labels"].astype(str).apply(remap_context)
+
+    return df.reset_index(drop=True)
+
+
+def check_image_paths(df: pd.DataFrame, name: str):
+    pill_exists = df["pill_crop_path"].astype(str).apply(os.path.exists)
+    pres_exists = df["prescription_image_path"].astype(str).apply(os.path.exists)
+
+    print(f"{name} pill images existing:", pill_exists.sum(), "/", len(df))
+    print(f"{name} prescription images existing:", pres_exists.sum(), "/", len(df))
+
+    missing = (~pill_exists) | (~pres_exists)
+    if missing.sum() > 0:
+        print(f"[Warning] {name}: bỏ {missing.sum()} dòng vì thiếu ảnh.")
+        df = df[~missing].copy()
+
+    if len(df) == 0:
+        raise RuntimeError(f"{name} dataset rỗng sau khi lọc ảnh.")
+
+    return df.reset_index(drop=True)
 
 
 class GraphConv(nn.Module):
@@ -88,6 +159,7 @@ class GraphEncoder(nn.Module):
 
     def forward(self, adj):
         x = self.node_embeddings
+
         x = self.conv1(x, adj)
         x = self.norm1(x)
         x = torch.relu(x)
@@ -96,6 +168,7 @@ class GraphEncoder(nn.Module):
         x = self.conv2(x, adj)
         x = self.norm2(x)
         x = torch.relu(x)
+
         return x
 
 
@@ -117,6 +190,7 @@ class BestPIKADataset(Dataset):
 
         if self.pill_transform:
             pill_img = self.pill_transform(pill_img)
+
         if self.pres_transform:
             pres_img = self.pres_transform(pres_img)
 
@@ -127,6 +201,7 @@ class BestPIKADataset(Dataset):
 
         padded = [-1] * self.max_context_len
         mask = [0] * self.max_context_len
+
         for i, val in enumerate(context_labels):
             padded[i] = int(val)
             mask[i] = 1
@@ -138,15 +213,16 @@ class BestPIKADataset(Dataset):
 
 
 def build_transforms(image_size=224):
+    # Theo paper PIKA: Resize 224, RandomRotation 10 độ, HorizontalFlip.
+    # Không dùng ColorJitter để bám paper sát hơn.
     train_tfms = transforms.Compose([
         transforms.Resize((image_size, image_size)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomRotation(10),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         transforms.ToTensor(),
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
+            std=[0.229, 0.224, 0.225],
         ),
     ])
 
@@ -155,7 +231,7 @@ def build_transforms(image_size=224):
         transforms.ToTensor(),
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
+            std=[0.229, 0.224, 0.225],
         ),
     ])
 
@@ -163,20 +239,29 @@ def build_transforms(image_size=224):
 
 
 class BestPIKAModel(nn.Module):
-    def __init__(self, num_classes, adj_matrix, pill_model_name, pres_model_name, hidden_dim=256):
+    def __init__(
+        self,
+        num_classes,
+        adj_matrix,
+        pill_model_name,
+        pres_model_name,
+        hidden_dim=256,
+        pretrained=True,
+    ):
         super().__init__()
 
         self.pill_encoder = timm.create_model(
             pill_model_name,
-            pretrained=True,
+            pretrained=pretrained,
             num_classes=0,
-            global_pool="avg"
+            global_pool="avg",
         )
+
         self.pres_encoder = timm.create_model(
             pres_model_name,
-            pretrained=True,
+            pretrained=pretrained,
             num_classes=0,
-            global_pool="avg"
+            global_pool="avg",
         )
 
         pill_dim = self.pill_encoder.num_features
@@ -192,7 +277,7 @@ class BestPIKAModel(nn.Module):
             nn.Linear(hidden_dim * 3, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 3),
-            nn.Sigmoid()
+            nn.Sigmoid(),
         )
 
         self.fusion = nn.Sequential(
@@ -214,6 +299,7 @@ class BestPIKAModel(nn.Module):
 
         safe_indices = context_indices.clone()
         safe_indices[safe_indices < 0] = 0
+
         context_emb = graph_nodes[safe_indices]
 
         scores = (context_emb * pill_feat.unsqueeze(1)).sum(dim=-1) / math.sqrt(context_emb.size(-1))
@@ -221,6 +307,7 @@ class BestPIKAModel(nn.Module):
 
         attn_weights = torch.zeros_like(scores)
         has_context = context_mask.any(dim=1)
+
         if has_context.any():
             attn_weights[has_context] = torch.softmax(scores[has_context], dim=1)
 
@@ -239,20 +326,23 @@ class BestPIKAModel(nn.Module):
             graph_ctx,
             pill_feat * pres_feat,
             pill_feat * graph_ctx,
-            pres_feat * graph_ctx
+            pres_feat * graph_ctx,
         ], dim=1)
 
         fused = self.fusion(fused)
         out = self.classifier(fused)
+
         return out
 
 
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
     model.train()
+
     running_loss = 0.0
     all_preds, all_labels = [], []
 
     pbar = tqdm(loader, desc="Training", leave=False)
+
     for pill_imgs, pres_imgs, context_indices, context_mask, labels in pbar:
         pill_imgs = pill_imgs.to(device)
         pres_imgs = pres_imgs.to(device)
@@ -271,12 +361,12 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
         scaler.update()
 
         running_loss += loss.item() * pill_imgs.size(0)
-        preds = outputs.argmax(dim=1)
 
+        preds = outputs.argmax(dim=1)
         all_preds.extend(preds.detach().cpu().numpy())
         all_labels.extend(labels.detach().cpu().numpy())
 
-    epoch_loss = running_loss / len(loader.dataset)
+    epoch_loss = running_loss / max(1, len(loader.dataset))
     epoch_acc = accuracy_score(all_labels, all_preds)
     epoch_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
 
@@ -286,10 +376,12 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
 @torch.no_grad()
 def validate_one_epoch(model, loader, criterion, device):
     model.eval()
+
     running_loss = 0.0
     all_preds, all_labels = [], []
 
     pbar = tqdm(loader, desc="Validation", leave=False)
+
     for pill_imgs, pres_imgs, context_indices, context_mask, labels in pbar:
         pill_imgs = pill_imgs.to(device)
         pres_imgs = pres_imgs.to(device)
@@ -302,113 +394,154 @@ def validate_one_epoch(model, loader, criterion, device):
             loss = criterion(outputs, labels)
 
         running_loss += loss.item() * pill_imgs.size(0)
-        preds = outputs.argmax(dim=1)
 
+        preds = outputs.argmax(dim=1)
         all_preds.extend(preds.detach().cpu().numpy())
         all_labels.extend(labels.detach().cpu().numpy())
 
-    epoch_loss = running_loss / len(loader.dataset)
+    epoch_loss = running_loss / max(1, len(loader.dataset))
     epoch_acc = accuracy_score(all_labels, all_preds)
-    epoch_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
 
-    return epoch_loss, epoch_acc, epoch_f1, all_labels, all_preds
+    precision, recall, macro_f1, _ = precision_recall_fscore_support(
+        all_labels,
+        all_preds,
+        average="macro",
+        zero_division=0,
+    )
+
+    return epoch_loss, epoch_acc, precision, recall, macro_f1, all_labels, all_preds
 
 
-def main():
-    seed_everything(SEED)
-    ensure_dir(OUTPUT_DIR)
-    device = get_device()
-    print("Using device:", device)
+def build_graph_matrix(graph_labels_json, graph_pmi_npy, idx_to_label, device):
+    graph_labels = load_json(graph_labels_json)
+    graph_labels = [int(x) for x in graph_labels]
 
-    df = pd.read_csv(CSV_PATH)
-    print("Total metadata rows:", len(df))
+    pmi = np.load(graph_pmi_npy)
 
-    with open(GRAPH_LABELS_JSON, "r", encoding="utf-8") as f:
-        graph_labels = json.load(f)
-
-    pmi = np.load(GRAPH_PMI_NPY)
     print("Graph PMI shape:", pmi.shape)
 
-    label_counts = Counter(df["pill_label"].tolist())
-    valid_labels = sorted([label for label, count in label_counts.items() if count >= 2])
+    graph_label_to_idx = {int(label): idx for idx, label in enumerate(graph_labels)}
 
-    df = df[df["pill_label"].isin(valid_labels)].copy()
-    old_to_new = {old_label: new_label for new_label, old_label in enumerate(valid_labels)}
-    df["mapped_label"] = df["pill_label"].map(old_to_new)
+    ordered_old_labels = [int(idx_to_label[i]) for i in range(len(idx_to_label))]
 
-    def remap_context(s):
-        vals = json.loads(s)
-        vals = [old_to_new[v] for v in vals if v in old_to_new]
-        vals = sorted(list(set(vals)))
-        return json.dumps(vals)
+    missing = [label for label in ordered_old_labels if label not in graph_label_to_idx]
+    if len(missing) > 0:
+        raise RuntimeError(f"Graph thiếu các label này: {missing[:20]}")
 
-    df["context_labels_mapped"] = df["context_labels"].apply(remap_context)
+    graph_indices = [graph_label_to_idx[label] for label in ordered_old_labels]
 
-    print("Rows after filtering rare classes:", len(df))
-    print("Usable classes:", df["mapped_label"].nunique())
-    print("Min mapped label:", int(df["mapped_label"].min()))
-    print("Max mapped label:", int(df["mapped_label"].max()))
-
-    graph_label_to_idx = {label: idx for idx, label in enumerate(graph_labels)}
-    graph_indices = [graph_label_to_idx[label] for label in valid_labels]
     sub_pmi = pmi[np.ix_(graph_indices, graph_indices)]
     sub_pmi = normalize_adjacency(sub_pmi)
     sub_pmi = torch.tensor(sub_pmi, dtype=torch.float32).to(device)
 
-    context_lengths = df["context_labels_mapped"].apply(lambda x: len(json.loads(x)))
-    max_context_len = max(1, min(MAX_CONTEXT_LEN, int(context_lengths.max())))
-    print("Max context length used:", max_context_len)
+    return sub_pmi
 
-    train_df, val_df = train_test_split(
-        df,
-        test_size=0.2,
-        random_state=SEED,
-        stratify=df["mapped_label"]
+
+def main(args):
+    seed_everything(args.seed)
+    ensure_dir(args.output_dir)
+
+    device = get_device()
+    print("Using device:", device)
+
+    print("Train CSV:", args.train_csv)
+    print("Val CSV  :", args.val_csv)
+    print("Test CSV :", args.test_csv)
+    print("Data root:", args.data_root)
+
+    graph_labels_json = args.graph_labels_json
+    graph_pmi_npy = args.graph_pmi_npy
+
+    if graph_labels_json == "":
+        graph_labels_json = os.path.join(args.data_root, "graph_labels.json")
+
+    if graph_pmi_npy == "":
+        graph_pmi_npy = os.path.join(args.data_root, "graph_pmi.npy")
+
+    print("Graph labels:", graph_labels_json)
+    print("Graph PMI   :", graph_pmi_npy)
+
+    label_to_idx, idx_to_label = build_label_mapping(
+        train_csv=args.train_csv,
+        val_csv=args.val_csv,
+        test_csv=args.test_csv,
     )
 
-    print("Train rows:", len(train_df))
-    print("Val rows:", len(val_df))
+    num_classes = len(label_to_idx)
+    print("Num classes:", num_classes)
 
-    train_tfms, val_tfms = build_transforms(IMAGE_SIZE)
+    train_df = pd.read_csv(args.train_csv)
+    val_df = pd.read_csv(args.val_csv)
+
+    train_df = add_mapped_columns(train_df, label_to_idx)
+    val_df = add_mapped_columns(val_df, label_to_idx)
+
+    train_df = check_image_paths(train_df, "Train")
+    val_df = check_image_paths(val_df, "Val")
+
+    sub_pmi = build_graph_matrix(
+        graph_labels_json=graph_labels_json,
+        graph_pmi_npy=graph_pmi_npy,
+        idx_to_label=idx_to_label,
+        device=device,
+    )
+
+    context_lengths = train_df["context_labels_mapped"].apply(lambda x: len(json.loads(x)))
+    max_context_len = max(1, min(args.max_context_len, int(context_lengths.max())))
+
+    print("Max context length used:", max_context_len)
+    print("Train rows:", len(train_df))
+    print("Val rows  :", len(val_df))
+
+    with open(os.path.join(args.output_dir, "label_to_idx.json"), "w", encoding="utf-8") as f:
+        json.dump({str(k): int(v) for k, v in label_to_idx.items()}, f, ensure_ascii=False, indent=2)
+
+    with open(os.path.join(args.output_dir, "idx_to_label.json"), "w", encoding="utf-8") as f:
+        json.dump({str(k): int(v) for k, v in idx_to_label.items()}, f, ensure_ascii=False, indent=2)
+
+    train_tfms, val_tfms = build_transforms(args.image_size)
 
     train_dataset = BestPIKADataset(
         train_df,
         max_context_len=max_context_len,
         pill_transform=train_tfms,
-        pres_transform=train_tfms
+        pres_transform=train_tfms,
     )
+
     val_dataset = BestPIKADataset(
         val_df,
         max_context_len=max_context_len,
         pill_transform=val_tfms,
-        pres_transform=val_tfms
+        pres_transform=val_tfms,
     )
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=args.batch_size,
         shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=True
+        num_workers=args.num_workers,
+        pin_memory=True,
     )
 
-    num_classes = df["mapped_label"].nunique()
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+
     model = BestPIKAModel(
         num_classes=num_classes,
         adj_matrix=sub_pmi,
-        pill_model_name=PILL_MODEL_NAME,
-        pres_model_name=PRES_MODEL_NAME,
-        hidden_dim=HIDDEN_DIM
+        pill_model_name=args.pill_model_name,
+        pres_model_name=args.pres_model_name,
+        hidden_dim=args.hidden_dim,
+        pretrained=not args.no_pretrained,
     ).to(device)
 
     train_label_counts = Counter(train_df["mapped_label"].tolist())
+
     class_weights = []
     for class_id in range(num_classes):
         count = train_label_counts.get(class_id, 1)
@@ -418,49 +551,152 @@ def main():
     class_weights = class_weights / class_weights.sum() * num_classes
     class_weights = class_weights.to(device)
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=args.label_smoothing,
+    )
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+    )
+
     scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
 
-    best_f1 = 0.0
+    best_f1 = -1.0
     best_labels, best_preds = None, None
-    patience = 4
+    patience = args.patience
     bad_epochs = 0
 
-    for epoch in range(EPOCHS):
-        print(f"\nEpoch [{epoch+1}/{EPOCHS}]")
+    history = []
+
+    best_path = os.path.join(args.output_dir, args.best_name)
+    last_path = os.path.join(args.output_dir, args.last_name)
+
+    for epoch in range(1, args.epochs + 1):
+        print(f"\nEpoch [{epoch}/{args.epochs}]")
         print(f"Current LR: {optimizer.param_groups[0]['lr']:.6f}")
 
         train_loss, train_acc, train_f1 = train_one_epoch(
-            model, train_loader, criterion, optimizer, scaler, device
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            scaler,
+            device,
         )
-        val_loss, val_acc, val_f1, val_labels, val_preds = validate_one_epoch(
-            model, val_loader, criterion, device
+
+        val_loss, val_acc, val_precision, val_recall, val_f1, val_labels, val_preds = validate_one_epoch(
+            model,
+            val_loader,
+            criterion,
+            device,
         )
+
         scheduler.step()
 
         print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Train Macro F1: {train_f1:.4f}")
-        print(f"Val   Loss: {val_loss:.4f} | Val   Acc: {val_acc:.4f} | Val   Macro F1: {val_f1:.4f}")
+        print(f"Val Loss  : {val_loss:.4f} | Val Acc  : {val_acc:.4f} | Val Macro F1  : {val_f1:.4f}")
+
+        row = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "train_macro_f1": train_f1,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+            "val_macro_precision": val_precision,
+            "val_macro_recall": val_recall,
+            "val_macro_f1": val_f1,
+            "lr": optimizer.param_groups[0]["lr"],
+        }
+        history.append(row)
+
+        pd.DataFrame(history).to_csv(
+            os.path.join(args.output_dir, "train_history.csv"),
+            index=False,
+        )
+
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "num_classes": num_classes,
+            "label_to_idx": label_to_idx,
+            "idx_to_label": idx_to_label,
+            "pill_model_name": args.pill_model_name,
+            "pres_model_name": args.pres_model_name,
+            "hidden_dim": args.hidden_dim,
+            "max_context_len": max_context_len,
+            "graph_labels_json": graph_labels_json,
+            "graph_pmi_npy": graph_pmi_npy,
+            "val_macro_f1": val_f1,
+            "val_acc": val_acc,
+            "model_type": "BestPIKAModel",
+        }
+
+        torch.save(checkpoint, last_path)
 
         if val_f1 > best_f1:
             best_f1 = val_f1
             best_labels, best_preds = val_labels, val_preds
-            torch.save(model.state_dict(), os.path.join(OUTPUT_DIR, "best_pika_model.pth"))
-            print(f"Saved best model with Val Macro F1 = {best_f1:.4f}")
+
+            torch.save(checkpoint, best_path)
+
+            print(f"Saved best checkpoint: {best_path}")
+            print(f"Best Val Macro F1: {best_f1:.4f}")
+
             bad_epochs = 0
         else:
             bad_epochs += 1
-            if bad_epochs >= patience:
-                print(f"Early stopping triggered after {patience} non-improving epochs.")
-                break
 
-    print("\nBest Val Macro F1:", round(best_f1, 4))
+        if bad_epochs >= patience:
+            print(f"Early stopping triggered after {patience} non-improving epochs.")
+            break
 
-    if best_labels is not None and best_preds is not None:
-        print("\nClassification report on best validation set:")
-        print(classification_report(best_labels, best_preds, digits=4, zero_division=0))
+    print("\nTraining done.")
+    print("Best checkpoint:", best_path)
+    print("Best Val Macro F1:", best_f1)
+    print("Last checkpoint:", last_path)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Train M6 Best PIKA model using predefined train/val split CSV")
+
+    parser.add_argument("--train_csv", type=str, required=True)
+    parser.add_argument("--val_csv", type=str, required=True)
+    parser.add_argument("--test_csv", type=str, default="")
+
+    parser.add_argument("--data_root", type=str, default="/content/processed_pika_best")
+    parser.add_argument("--graph_labels_json", type=str, default="")
+    parser.add_argument("--graph_pmi_npy", type=str, default="")
+
+    parser.add_argument("--output_dir", type=str, default="/content/drive/MyDrive/model/M6_split_best_pika")
+    parser.add_argument("--best_name", type=str, default="M6_best_pika_split_best.pth")
+    parser.add_argument("--last_name", type=str, default="M6_best_pika_split_last.pth")
+
+    parser.add_argument("--pill_model_name", type=str, default="tf_efficientnetv2_s.in21k_ft_in1k")
+    parser.add_argument("--pres_model_name", type=str, default="resnet18.a1_in1k")
+    parser.add_argument("--hidden_dim", type=int, default=256)
+    parser.add_argument("--max_context_len", type=int, default=8)
+
+    parser.add_argument("--image_size", type=int, default=224)
+    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--batch_size", type=int, default=20)
+    parser.add_argument("--num_workers", type=int, default=2)
+
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--label_smoothing", type=float, default=0.05)
+    parser.add_argument("--patience", type=int, default=4)
+
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no_pretrained", action="store_true")
+
+    args = parser.parse_args()
+    main(args)

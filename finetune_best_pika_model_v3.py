@@ -1,287 +1,69 @@
 import os
 import json
-import math
-import random
+import argparse
 from collections import Counter
 
-import numpy as np
 import pandas as pd
-from PIL import Image, ImageFile
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score, accuracy_score, classification_report
-
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
+from torch.utils.data import DataLoader
 
-import timm
+from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
+
 from tqdm import tqdm
 
-ImageFile.LOAD_TRUNCATED_IMAGES = True
-
-DATA_ROOT = os.environ.get("PIKA_BEST_OUTPUT_ROOT", "/content/processed_pika_best")
-CSV_PATH = os.path.join(DATA_ROOT, "best_pika_metadata.csv")
-GRAPH_LABELS_JSON = os.path.join(DATA_ROOT, "graph_labels.json")
-GRAPH_PMI_NPY = os.path.join(DATA_ROOT, "graph_pmi.npy")
-
-BASE_CHECKPOINT = os.environ.get(
-    "PIKA_BASE_CHECKPOINT",
-    "/content/vaipe-contextual-pill-recognition/outputs_best_pika_finetune_v2/best_pika_model_finetuned_v2.pth"
+from train_best_pika_model import (
+    seed_everything,
+    ensure_dir,
+    get_device,
+    BestPIKAModel,
+    BestPIKADataset,
+    build_label_mapping,
+    add_mapped_columns,
+    check_image_paths,
+    build_graph_matrix,
+    build_transforms,
 )
 
-IMAGE_SIZE = 224
-BATCH_SIZE = 20
-EPOCHS = 12
-WEIGHT_DECAY = 1e-4
-NUM_WORKERS = 2
-SEED = 42
 
-PILL_MODEL_NAME = "tf_efficientnetv2_s.in21k_ft_in1k"
-PRES_MODEL_NAME = "resnet18.a1_in1k"
-
-HIDDEN_DIM = 256
-MAX_CONTEXT_LEN = 8
-OUTPUT_DIR = "./outputs_best_pika_finetune_v3"
-
-EARLY_STOPPING_PATIENCE = 4
-GRAD_CLIP_NORM = 1.0
-LABEL_SMOOTHING = 0.03
-
-LR_PILL_ENCODER = 5e-6
-LR_PRES_ENCODER = 5e-6
-LR_GRAPH_ENCODER = 1e-5
-LR_FUSION_HEAD = 5e-5
-LR_CLASSIFIER = 5e-5
-
-BEST_MODEL_PATH = os.path.join(OUTPUT_DIR, "best_pika_model_finetuned_v3.pth")
-RESUME_CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "resume_checkpoint_v3.pth")
+def safe_torch_load(path, device):
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
 
 
-def seed_everything(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+def normalize_label_to_idx(raw_mapping):
+    return {int(k): int(v) for k, v in raw_mapping.items()}
 
 
-def ensure_dir(path):
-    os.makedirs(path, exist_ok=True)
+def normalize_idx_to_label(raw_mapping):
+    return {int(k): int(v) for k, v in raw_mapping.items()}
 
 
-def get_device():
-    return "cuda" if torch.cuda.is_available() else "cpu"
+def build_class_weights(train_df: pd.DataFrame, num_classes: int, device: str):
+    train_label_counts = Counter(train_df["mapped_label"].tolist())
 
+    class_weights = []
+    for class_id in range(num_classes):
+        count = train_label_counts.get(class_id, 1)
+        class_weights.append(1.0 / count)
 
-def normalize_adjacency(adj):
-    adj = adj + np.eye(adj.shape[0], dtype=np.float32)
-    degree = adj.sum(axis=1)
-    degree = np.where(degree == 0, 1.0, degree)
-    d_inv_sqrt = np.power(degree, -0.5)
-    d_mat = np.diag(d_inv_sqrt)
-    return d_mat @ adj @ d_mat
+    class_weights = torch.tensor(class_weights, dtype=torch.float32)
+    class_weights = class_weights / class_weights.sum() * num_classes
 
-
-def effective_num_weights(counts, beta=0.999):
-    weights = []
-    for c in counts:
-        c = max(int(c), 1)
-        eff_num = 1.0 - (beta ** c)
-        w = (1.0 - beta) / eff_num
-        weights.append(w)
-    weights = np.array(weights, dtype=np.float32)
-    weights = weights / weights.sum() * len(weights)
-    return weights
-
-
-class GraphConv(nn.Module):
-    def __init__(self, in_dim, out_dim):
-        super().__init__()
-        self.linear = nn.Linear(in_dim, out_dim, bias=False)
-
-    def forward(self, x, adj):
-        x = self.linear(x)
-        x = torch.matmul(adj, x)
-        return x
-
-
-class GraphEncoder(nn.Module):
-    def __init__(self, num_nodes, hidden_dim):
-        super().__init__()
-        self.node_embeddings = nn.Parameter(torch.randn(num_nodes, hidden_dim) * 0.02)
-        self.conv1 = GraphConv(hidden_dim, hidden_dim)
-        self.conv2 = GraphConv(hidden_dim, hidden_dim)
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(0.2)
-
-    def forward(self, adj):
-        x = self.node_embeddings
-        x = self.conv1(x, adj)
-        x = self.norm1(x)
-        x = torch.relu(x)
-        x = self.dropout(x)
-
-        x = self.conv2(x, adj)
-        x = self.norm2(x)
-        x = torch.relu(x)
-        return x
-
-
-class BestPIKADataset(Dataset):
-    def __init__(self, df, max_context_len, pill_transform=None, pres_transform=None):
-        self.df = df.reset_index(drop=True)
-        self.max_context_len = max_context_len
-        self.pill_transform = pill_transform
-        self.pres_transform = pres_transform
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-
-        pill_img = Image.open(row["pill_crop_path"]).convert("RGB")
-        pres_img = Image.open(row["prescription_image_path"]).convert("RGB")
-
-        if self.pill_transform:
-            pill_img = self.pill_transform(pill_img)
-        if self.pres_transform:
-            pres_img = self.pres_transform(pres_img)
-
-        label = int(row["mapped_label"])
-
-        context_labels = json.loads(row["context_labels_mapped"])
-        context_labels = context_labels[:self.max_context_len]
-
-        padded = [-1] * self.max_context_len
-        mask = [0] * self.max_context_len
-        for i, val in enumerate(context_labels):
-            padded[i] = int(val)
-            mask[i] = 1
-
-        context_indices = torch.tensor(padded, dtype=torch.long)
-        context_mask = torch.tensor(mask, dtype=torch.bool)
-
-        return pill_img, pres_img, context_indices, context_mask, label
-
-
-def build_transforms(image_size=224):
-    train_tfms = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(8),
-        transforms.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.12),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        ),
-    ])
-
-    val_tfms = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        ),
-    ])
-
-    return train_tfms, val_tfms
-
-
-class BestPIKAModel(nn.Module):
-    def __init__(self, num_classes, adj_matrix, pill_model_name, pres_model_name, hidden_dim=256):
-        super().__init__()
-
-        self.pill_encoder = timm.create_model(
-            pill_model_name,
-            pretrained=True,
-            num_classes=0,
-            global_pool="avg"
-        )
-        self.pres_encoder = timm.create_model(
-            pres_model_name,
-            pretrained=True,
-            num_classes=0,
-            global_pool="avg"
-        )
-
-        pill_dim = self.pill_encoder.num_features
-        pres_dim = self.pres_encoder.num_features
-
-        self.pill_proj = nn.Linear(pill_dim, hidden_dim)
-        self.pres_proj = nn.Linear(pres_dim, hidden_dim)
-
-        self.graph_encoder = GraphEncoder(num_nodes=num_classes, hidden_dim=hidden_dim)
-        self.register_buffer("adj_matrix", adj_matrix)
-
-        self.gate = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 3),
-            nn.Sigmoid()
-        )
-
-        self.fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 6, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-        )
-
-        self.classifier = nn.Linear(256, num_classes)
-
-    def forward(self, pill_img, pres_img, context_indices, context_mask):
-        pill_feat = self.pill_proj(self.pill_encoder(pill_img))
-        pres_feat = self.pres_proj(self.pres_encoder(pres_img))
-
-        graph_nodes = self.graph_encoder(self.adj_matrix)
-
-        safe_indices = context_indices.clone()
-        safe_indices[safe_indices < 0] = 0
-        context_emb = graph_nodes[safe_indices]
-
-        scores = (context_emb * pill_feat.unsqueeze(1)).sum(dim=-1) / math.sqrt(context_emb.size(-1))
-        scores = scores.masked_fill(~context_mask, -1e9)
-
-        attn_weights = torch.zeros_like(scores)
-        has_context = context_mask.any(dim=1)
-        if has_context.any():
-            attn_weights[has_context] = torch.softmax(scores[has_context], dim=1)
-
-        graph_ctx = (attn_weights.unsqueeze(-1) * context_emb).sum(dim=1)
-
-        gate_input = torch.cat([pill_feat, pres_feat, graph_ctx], dim=1)
-        gates = self.gate(gate_input)
-
-        pill_feat = pill_feat * gates[:, 0].unsqueeze(1)
-        pres_feat = pres_feat * gates[:, 1].unsqueeze(1)
-        graph_ctx = graph_ctx * gates[:, 2].unsqueeze(1)
-
-        fused = torch.cat([
-            pill_feat,
-            pres_feat,
-            graph_ctx,
-            pill_feat * pres_feat,
-            pill_feat * graph_ctx,
-            pres_feat * graph_ctx
-        ], dim=1)
-
-        fused = self.fusion(fused)
-        out = self.classifier(fused)
-        return out
+    return class_weights.to(device)
 
 
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
     model.train()
-    running_loss = 0.0
-    all_preds, all_labels = [], []
 
-    pbar = tqdm(loader, desc="Training", leave=False)
+    running_loss = 0.0
+    all_preds = []
+    all_labels = []
+
+    pbar = tqdm(loader, desc="M9 Fine-tuning", leave=False)
+
     for pill_imgs, pres_imgs, context_indices, context_mask, labels in pbar:
         pill_imgs = pill_imgs.to(device)
         pres_imgs = pres_imgs.to(device)
@@ -296,18 +78,16 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
             loss = criterion(outputs, labels)
 
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
         scaler.step(optimizer)
         scaler.update()
 
         running_loss += loss.item() * pill_imgs.size(0)
+
         preds = outputs.argmax(dim=1)
+        all_preds.extend(preds.detach().cpu().numpy().tolist())
+        all_labels.extend(labels.detach().cpu().numpy().tolist())
 
-        all_preds.extend(preds.detach().cpu().numpy())
-        all_labels.extend(labels.detach().cpu().numpy())
-
-    epoch_loss = running_loss / len(loader.dataset)
+    epoch_loss = running_loss / max(1, len(loader.dataset))
     epoch_acc = accuracy_score(all_labels, all_preds)
     epoch_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
 
@@ -317,10 +97,13 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device):
 @torch.no_grad()
 def validate_one_epoch(model, loader, criterion, device):
     model.eval()
+
     running_loss = 0.0
-    all_preds, all_labels = [], []
+    all_preds = []
+    all_labels = []
 
     pbar = tqdm(loader, desc="Validation", leave=False)
+
     for pill_imgs, pres_imgs, context_indices, context_mask, labels in pbar:
         pill_imgs = pill_imgs.to(device)
         pres_imgs = pres_imgs.to(device)
@@ -333,206 +116,324 @@ def validate_one_epoch(model, loader, criterion, device):
             loss = criterion(outputs, labels)
 
         running_loss += loss.item() * pill_imgs.size(0)
+
         preds = outputs.argmax(dim=1)
+        all_preds.extend(preds.detach().cpu().numpy().tolist())
+        all_labels.extend(labels.detach().cpu().numpy().tolist())
 
-        all_preds.extend(preds.detach().cpu().numpy())
-        all_labels.extend(labels.detach().cpu().numpy())
-
-    epoch_loss = running_loss / len(loader.dataset)
+    epoch_loss = running_loss / max(1, len(loader.dataset))
     epoch_acc = accuracy_score(all_labels, all_preds)
-    epoch_f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0)
 
-    return epoch_loss, epoch_acc, epoch_f1, all_labels, all_preds
+    precision, recall, macro_f1, _ = precision_recall_fscore_support(
+        all_labels,
+        all_preds,
+        average="macro",
+        zero_division=0,
+    )
 
-
-def save_resume_checkpoint(model, optimizer, scheduler, scaler, epoch, best_f1, bad_epochs, path):
-    torch.save({
-        "epoch": epoch,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "scaler_state_dict": scaler.state_dict(),
-        "best_f1": best_f1,
-        "bad_epochs": bad_epochs,
-    }, path)
+    return epoch_loss, epoch_acc, precision, recall, macro_f1
 
 
-def main():
-    seed_everything(SEED)
-    ensure_dir(OUTPUT_DIR)
+def main(args):
+    seed_everything(args.seed)
+    ensure_dir(args.output_dir)
+
     device = get_device()
     print("Using device:", device)
 
-    df = pd.read_csv(CSV_PATH)
-    print("Total metadata rows:", len(df))
+    print("Train CSV:", args.train_csv)
+    print("Val CSV  :", args.val_csv)
+    print("Test CSV :", args.test_csv)
+    print("Base checkpoint:", args.base_checkpoint)
+    print("Data root:", args.data_root)
 
-    with open(GRAPH_LABELS_JSON, "r", encoding="utf-8") as f:
-        graph_labels = json.load(f)
+    base_ckpt = safe_torch_load(args.base_checkpoint, device)
 
-    pmi = np.load(GRAPH_PMI_NPY)
-    print("Graph PMI shape:", pmi.shape)
+    if "model_state_dict" not in base_ckpt:
+        raise RuntimeError("Base checkpoint thiếu model_state_dict.")
 
-    label_counts = Counter(df["pill_label"].tolist())
-    valid_labels = sorted([label for label, count in label_counts.items() if count >= 2])
+    if "label_to_idx" in base_ckpt and "idx_to_label" in base_ckpt:
+        label_to_idx = normalize_label_to_idx(base_ckpt["label_to_idx"])
+        idx_to_label = normalize_idx_to_label(base_ckpt["idx_to_label"])
+    else:
+        label_to_idx, idx_to_label = build_label_mapping(
+            train_csv=args.train_csv,
+            val_csv=args.val_csv,
+            test_csv=args.test_csv,
+        )
 
-    df = df[df["pill_label"].isin(valid_labels)].copy()
-    old_to_new = {old_label: new_label for new_label, old_label in enumerate(valid_labels)}
-    df["mapped_label"] = df["pill_label"].map(old_to_new)
+    num_classes = int(base_ckpt.get("num_classes", len(label_to_idx)))
+    pill_model_name = base_ckpt.get("pill_model_name", args.pill_model_name)
+    pres_model_name = base_ckpt.get("pres_model_name", args.pres_model_name)
+    hidden_dim = int(base_ckpt.get("hidden_dim", args.hidden_dim))
+    max_context_len_from_ckpt = int(base_ckpt.get("max_context_len", args.max_context_len))
 
-    def remap_context(s):
-        vals = json.loads(s)
-        vals = [old_to_new[v] for v in vals if v in old_to_new]
-        vals = sorted(list(set(vals)))
-        return json.dumps(vals)
+    print("Pill model        :", pill_model_name)
+    print("Prescription model:", pres_model_name)
+    print("Hidden dim        :", hidden_dim)
+    print("Num classes       :", num_classes)
 
-    df["context_labels_mapped"] = df["context_labels"].apply(remap_context)
+    graph_labels_json = args.graph_labels_json
+    graph_pmi_npy = args.graph_pmi_npy
 
-    graph_label_to_idx = {label: idx for idx, label in enumerate(graph_labels)}
-    graph_indices = [graph_label_to_idx[label] for label in valid_labels]
-    sub_pmi = pmi[np.ix_(graph_indices, graph_indices)]
-    sub_pmi = normalize_adjacency(sub_pmi)
-    sub_pmi = torch.tensor(sub_pmi, dtype=torch.float32).to(device)
+    if graph_labels_json == "":
+        graph_labels_json = os.path.join(args.data_root, "graph_labels.json")
 
-    context_lengths = df["context_labels_mapped"].apply(lambda x: len(json.loads(x)))
-    max_context_len = max(1, min(MAX_CONTEXT_LEN, int(context_lengths.max())))
+    if graph_pmi_npy == "":
+        graph_pmi_npy = os.path.join(args.data_root, "graph_pmi.npy")
 
-    train_df, val_df = train_test_split(
-        df,
-        test_size=0.2,
-        random_state=SEED,
-        stratify=df["mapped_label"]
+    print("Graph labels:", graph_labels_json)
+    print("Graph PMI   :", graph_pmi_npy)
+
+    train_df = pd.read_csv(args.train_csv)
+    val_df = pd.read_csv(args.val_csv)
+
+    train_df = add_mapped_columns(train_df, label_to_idx)
+    val_df = add_mapped_columns(val_df, label_to_idx)
+
+    train_df = check_image_paths(train_df, "Train")
+    val_df = check_image_paths(val_df, "Val")
+
+    sub_pmi = build_graph_matrix(
+        graph_labels_json=graph_labels_json,
+        graph_pmi_npy=graph_pmi_npy,
+        idx_to_label=idx_to_label,
+        device=device,
     )
 
-    print("Rows after filtering rare classes:", len(df))
-    print("Usable classes:", df["mapped_label"].nunique())
-    print("Min mapped label:", int(df["mapped_label"].min()))
-    print("Max mapped label:", int(df["mapped_label"].max()))
-    print("Train rows:", len(train_df))
-    print("Val rows:", len(val_df))
+    max_context_len = max_context_len_from_ckpt
+
     print("Max context length used:", max_context_len)
+    print("Train rows:", len(train_df))
+    print("Val rows  :", len(val_df))
 
-    train_tfms, val_tfms = build_transforms(IMAGE_SIZE)
+    with open(os.path.join(args.output_dir, "label_to_idx.json"), "w", encoding="utf-8") as f:
+        json.dump({str(k): int(v) for k, v in label_to_idx.items()}, f, ensure_ascii=False, indent=2)
 
-    train_dataset = BestPIKADataset(train_df, max_context_len, train_tfms, train_tfms)
-    val_dataset = BestPIKADataset(val_df, max_context_len, val_tfms, val_tfms)
+    with open(os.path.join(args.output_dir, "idx_to_label.json"), "w", encoding="utf-8") as f:
+        json.dump({str(k): int(v) for k, v in idx_to_label.items()}, f, ensure_ascii=False, indent=2)
+
+    train_tfms, val_tfms = build_transforms(args.image_size)
+
+    train_dataset = BestPIKADataset(
+        train_df,
+        max_context_len=max_context_len,
+        pill_transform=train_tfms,
+        pres_transform=train_tfms,
+    )
+
+    val_dataset = BestPIKADataset(
+        val_df,
+        max_context_len=max_context_len,
+        pill_transform=val_tfms,
+        pres_transform=val_tfms,
+    )
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=args.batch_size,
         shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=(device == "cuda")
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=(device == "cuda")
+        num_workers=args.num_workers,
+        pin_memory=True,
     )
 
-    num_classes = df["mapped_label"].nunique()
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+    )
+
     model = BestPIKAModel(
         num_classes=num_classes,
         adj_matrix=sub_pmi,
-        pill_model_name=PILL_MODEL_NAME,
-        pres_model_name=PRES_MODEL_NAME,
-        hidden_dim=HIDDEN_DIM
+        pill_model_name=pill_model_name,
+        pres_model_name=pres_model_name,
+        hidden_dim=hidden_dim,
+        pretrained=False,
     ).to(device)
 
-    counts_arr = [Counter(train_df["mapped_label"].tolist())[i] for i in range(num_classes)]
-    class_weights = effective_num_weights(counts_arr, beta=0.999)
-    class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
+    model.load_state_dict(base_ckpt["model_state_dict"], strict=True)
+    print("Loaded base checkpoint successfully.")
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTHING)
+    if args.freeze_backbone:
+        print("Freezing pill_encoder and pres_encoder.")
+        for p in model.pill_encoder.parameters():
+            p.requires_grad = False
+        for p in model.pres_encoder.parameters():
+            p.requires_grad = False
 
-    optimizer = torch.optim.AdamW([
-        {"params": model.pill_encoder.parameters(), "lr": LR_PILL_ENCODER},
-        {"params": model.pres_encoder.parameters(), "lr": LR_PRES_ENCODER},
-        {"params": model.graph_encoder.parameters(), "lr": LR_GRAPH_ENCODER},
-        {"params": model.pill_proj.parameters(), "lr": LR_FUSION_HEAD},
-        {"params": model.pres_proj.parameters(), "lr": LR_FUSION_HEAD},
-        {"params": model.gate.parameters(), "lr": LR_FUSION_HEAD},
-        {"params": model.fusion.parameters(), "lr": LR_FUSION_HEAD},
-        {"params": model.classifier.parameters(), "lr": LR_CLASSIFIER},
-    ], weight_decay=WEIGHT_DECAY)
+    class_weights = build_class_weights(train_df, num_classes, device)
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=args.label_smoothing,
+    )
+
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+    )
+
     scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
 
-    start_epoch = 0
-    best_f1 = 0.0
+    best_f1 = float(base_ckpt.get("val_macro_f1", -1.0))
+    print("Starting best_f1 from base checkpoint:", best_f1)
+
     bad_epochs = 0
-    best_labels, best_preds = None, None
+    history = []
 
-    if os.path.exists(RESUME_CHECKPOINT_PATH):
-        resume_ckpt = torch.load(RESUME_CHECKPOINT_PATH, map_location=device)
-        model.load_state_dict(resume_ckpt["model_state_dict"], strict=True)
-        optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
-        scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
-        scaler.load_state_dict(resume_ckpt["scaler_state_dict"])
-        start_epoch = resume_ckpt["epoch"]
-        best_f1 = resume_ckpt["best_f1"]
-        bad_epochs = resume_ckpt.get("bad_epochs", 0)
-        print(f"Resumed from checkpoint: {RESUME_CHECKPOINT_PATH}")
-        print(f"Resuming at epoch {start_epoch + 1}")
-        print(f"Previous best F1: {best_f1:.4f}")
-    else:
-        if os.path.exists(BASE_CHECKPOINT):
-            state = torch.load(BASE_CHECKPOINT, map_location=device)
-            model.load_state_dict(state, strict=True)
-            print(f"Loaded base checkpoint: {BASE_CHECKPOINT}")
-        else:
-            print(f"Checkpoint not found: {BASE_CHECKPOINT}")
-            print("Stop here and set PIKA_BASE_CHECKPOINT correctly.")
-            return
+    best_path = os.path.join(args.output_dir, args.best_name)
+    last_path = os.path.join(args.output_dir, args.last_name)
 
-    for epoch in range(start_epoch, EPOCHS):
-        print(f"\nEpoch [{epoch+1}/{EPOCHS}]")
-        print("Current LRs:", [f"{g['lr']:.7f}" for g in optimizer.param_groups])
+    initial_checkpoint = {
+        "epoch": 0,
+        "model_state_dict": model.state_dict(),
+        "num_classes": num_classes,
+        "label_to_idx": label_to_idx,
+        "idx_to_label": idx_to_label,
+        "pill_model_name": pill_model_name,
+        "pres_model_name": pres_model_name,
+        "hidden_dim": hidden_dim,
+        "max_context_len": max_context_len,
+        "graph_labels_json": graph_labels_json,
+        "graph_pmi_npy": graph_pmi_npy,
+        "val_macro_f1": best_f1,
+        "val_acc": base_ckpt.get("val_acc", None),
+        "model_type": "BestPIKAModel",
+        "fine_tune_from": args.base_checkpoint,
+        "stage": "M9_finetune_v3",
+    }
+
+    torch.save(initial_checkpoint, best_path)
+
+    for epoch in range(1, args.epochs + 1):
+        print(f"\nM9 Fine-tune Epoch [{epoch}/{args.epochs}]")
+        print(f"Current LR: {optimizer.param_groups[0]['lr']:.8f}")
 
         train_loss, train_acc, train_f1 = train_one_epoch(
-            model, train_loader, criterion, optimizer, scaler, device
+            model=model,
+            loader=train_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            scaler=scaler,
+            device=device,
         )
-        val_loss, val_acc, val_f1, val_labels, val_preds = validate_one_epoch(
-            model, val_loader, criterion, device
+
+        val_loss, val_acc, val_precision, val_recall, val_f1 = validate_one_epoch(
+            model=model,
+            loader=val_loader,
+            criterion=criterion,
+            device=device,
         )
+
         scheduler.step()
 
         print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Train Macro F1: {train_f1:.4f}")
-        print(f"Val   Loss: {val_loss:.4f} | Val   Acc: {val_acc:.4f} | Val   Macro F1: {val_f1:.4f}")
+        print(f"Val Loss  : {val_loss:.4f} | Val Acc  : {val_acc:.4f} | Val Macro F1  : {val_f1:.4f}")
+
+        row = {
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "train_macro_f1": train_f1,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+            "val_macro_precision": val_precision,
+            "val_macro_recall": val_recall,
+            "val_macro_f1": val_f1,
+            "lr": optimizer.param_groups[0]["lr"],
+        }
+
+        history.append(row)
+        pd.DataFrame(history).to_csv(
+            os.path.join(args.output_dir, "train_history.csv"),
+            index=False,
+        )
+
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "num_classes": num_classes,
+            "label_to_idx": label_to_idx,
+            "idx_to_label": idx_to_label,
+            "pill_model_name": pill_model_name,
+            "pres_model_name": pres_model_name,
+            "hidden_dim": hidden_dim,
+            "max_context_len": max_context_len,
+            "graph_labels_json": graph_labels_json,
+            "graph_pmi_npy": graph_pmi_npy,
+            "val_macro_f1": val_f1,
+            "val_acc": val_acc,
+            "model_type": "BestPIKAModel",
+            "fine_tune_from": args.base_checkpoint,
+            "stage": "M9_finetune_v3",
+        }
+
+        torch.save(checkpoint, last_path)
 
         if val_f1 > best_f1:
             best_f1 = val_f1
-            best_labels, best_preds = val_labels, val_preds
-            torch.save(model.state_dict(), BEST_MODEL_PATH)
-            print(f"Saved best model with Val Macro F1 = {best_f1:.4f}")
+            torch.save(checkpoint, best_path)
+
+            print(f"Saved best checkpoint: {best_path}")
+            print(f"Best Val Macro F1: {best_f1:.4f}")
+
             bad_epochs = 0
         else:
             bad_epochs += 1
-            print(f"No improvement for {bad_epochs} epoch(s).")
 
-        save_resume_checkpoint(
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            scaler=scaler,
-            epoch=epoch + 1,
-            best_f1=best_f1,
-            bad_epochs=bad_epochs,
-            path=RESUME_CHECKPOINT_PATH
-        )
-        print(f"Saved resume checkpoint at epoch {epoch + 1}")
-
-        if bad_epochs >= EARLY_STOPPING_PATIENCE:
-            print(f"Early stopping triggered after {EARLY_STOPPING_PATIENCE} non-improving epochs.")
+        if bad_epochs >= args.patience:
+            print(f"Early stopping triggered after {args.patience} non-improving epochs.")
             break
 
-    print("\nBest Val Macro F1:", round(best_f1, 4))
-    if best_labels is not None and best_preds is not None:
-        print("\nClassification report on best validation set:")
-        print(classification_report(best_labels, best_preds, digits=4, zero_division=0))
+    print("\nM9 fine-tuning done.")
+    print("Best checkpoint:", best_path)
+    print("Best Val Macro F1:", best_f1)
+    print("Last checkpoint:", last_path)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="M9 fine-tune BestPIKAModel from M8 checkpoint")
+
+    parser.add_argument("--train_csv", type=str, required=True)
+    parser.add_argument("--val_csv", type=str, required=True)
+    parser.add_argument("--test_csv", type=str, default="")
+
+    parser.add_argument("--base_checkpoint", type=str, required=True)
+
+    parser.add_argument("--data_root", type=str, default="/content/processed_pika_best")
+    parser.add_argument("--graph_labels_json", type=str, default="")
+    parser.add_argument("--graph_pmi_npy", type=str, default="")
+
+    parser.add_argument("--output_dir", type=str, default="/content/drive/MyDrive/model/M9_split_finetune_v3")
+    parser.add_argument("--best_name", type=str, default="M9_finetune_v3_split_best.pth")
+    parser.add_argument("--last_name", type=str, default="M9_finetune_v3_split_last.pth")
+
+    parser.add_argument("--pill_model_name", type=str, default="tf_efficientnetv2_s.in21k_ft_in1k")
+    parser.add_argument("--pres_model_name", type=str, default="resnet18.a1_in1k")
+    parser.add_argument("--hidden_dim", type=int, default=256)
+    parser.add_argument("--max_context_len", type=int, default=5)
+
+    parser.add_argument("--image_size", type=int, default=224)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--num_workers", type=int, default=2)
+
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--label_smoothing", type=float, default=0.05)
+    parser.add_argument("--patience", type=int, default=3)
+
+    parser.add_argument("--freeze_backbone", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+
+    args = parser.parse_args()
+    main(args)

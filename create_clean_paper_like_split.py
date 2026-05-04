@@ -1,7 +1,8 @@
 import argparse
 import json
-from pathlib import Path
+import random
 from collections import Counter, defaultdict
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -13,24 +14,20 @@ def ensure_dir(path):
 
 def read_csv_with_source(path, source_name):
     path = Path(path)
-
     if not path.exists():
         raise FileNotFoundError(f"CSV not found: {path}")
 
     df = pd.read_csv(path)
     df["source_split"] = source_name
-
     return df
 
 
 def parse_ratio_text(text):
     parts = [float(x.strip()) for x in text.split(",") if x.strip()]
-
     if len(parts) != 3:
         raise ValueError("split_ratios must have exactly 3 values: train,val,test")
 
     total = sum(parts)
-
     if total <= 0:
         raise ValueError("split ratios must sum to a positive value")
 
@@ -41,52 +38,12 @@ def parse_ratio_text(text):
     }
 
 
-def make_group_id(df, group_col):
-    if group_col in df.columns:
-        group = df[group_col].astype(str).fillna("missing_group")
-    else:
-        print(f"Warning: group_col '{group_col}' not found. Falling back to row-level groups.")
-        group = pd.Series([f"row_{i}" for i in range(len(df))], index=df.index)
-
-    return group
-
-
-def build_group_table(df, label_col, group_col):
-    group_rows = []
-
-    for group_id, g in df.groupby(group_col):
-        labels = g[label_col].astype(int).tolist()
-        label_counts = Counter(labels)
-
-        group_rows.append(
-            {
-                "group_id": group_id,
-                "num_rows": len(g),
-                "labels": sorted(label_counts.keys()),
-                "label_counts": dict(label_counts),
-                "num_unique_labels": len(label_counts),
-            }
-        )
-
-    group_df = pd.DataFrame(group_rows)
-
-    return group_df
-
-
-def compute_class_targets(total_counts, ratios):
+def build_class_targets(total_counts, ratios):
     """
-    Build per-class target counts for train / val / test.
-
-    Rules:
-    - class with 1 sample: train only
-    - class with 2 samples: train + val
-    - class with >=3 samples: at least 1 in train, val, test if possible
+    Soft per-class targets.
+    Main priority is still group-aware split and full train coverage.
     """
-    targets = {
-        "train": {},
-        "val": {},
-        "test": {},
-    }
+    targets = {"train": {}, "val": {}, "test": {}}
 
     for label, total in total_counts.items():
         total = int(total)
@@ -115,10 +72,8 @@ def compute_class_targets(total_counts, ratios):
                 test_target = 1
 
             train_target = total - val_target - test_target
-
             if train_target < 1:
                 train_target = 1
-
                 if val_target >= test_target and val_target > 1:
                     val_target -= 1
                 elif test_target > 1:
@@ -131,153 +86,35 @@ def compute_class_targets(total_counts, ratios):
     return targets
 
 
-def label_rarity_score(label_counts, total_counts):
-    score = 0.0
+def build_group_records(df, label_col, group_col, total_counts, seed=42):
+    rng = random.Random(seed)
+    group_records = []
 
-    for label, count in label_counts.items():
-        total = max(1, total_counts[int(label)])
-        score += float(count) / np.sqrt(float(total))
+    for group_id, g in df.groupby(group_col, sort=False):
+        labels = g[label_col].astype(int).tolist()
+        label_counts = Counter(labels)
+        unique_labels = sorted(label_counts.keys())
 
-    return score
+        rarity_score = 0.0
+        for lb, c in label_counts.items():
+            rarity_score += float(c) / np.sqrt(max(1.0, float(total_counts[lb])))
 
+        group_records.append({
+            "group_id": group_id,
+            "row_indices": g.index.tolist(),
+            "num_rows": len(g),
+            "labels": unique_labels,
+            "label_counts": dict(label_counts),
+            "num_unique_labels": len(unique_labels),
+            "rarity_score": rarity_score,
+            "rand": rng.random(),
+        })
 
-def choose_split_for_group(
-    label_counts,
-    group_size,
-    split_counts,
-    split_class_counts,
-    split_targets,
-    class_targets,
-    total_counts,
-    ratios,
-    balance_weight=0.30,
-    over_weight=1.50,
-):
-    best_split = None
-    best_score = None
-
-    for split in ["train", "val", "test"]:
-        current_total = split_counts[split]
-        target_total = split_targets[split]
-        new_total = current_total + group_size
-
-        class_benefit = 0.0
-
-        for raw_label, raw_count in label_counts.items():
-            label = int(raw_label)
-            count = int(raw_count)
-
-            target_for_class = class_targets[split].get(label, 0)
-            current_for_class = split_class_counts[split].get(label, 0)
-
-            remaining_need = max(0, target_for_class - current_for_class)
-            useful = min(count, remaining_need)
-
-            rarity = 1.0 / np.sqrt(max(1.0, float(total_counts[label])))
-            class_benefit += useful * rarity
-
-            # small bonus if this split has not seen this class yet and target wants it
-            if current_for_class == 0 and target_for_class > 0:
-                class_benefit += 0.25 * rarity
-
-        balance_penalty = abs(new_total - target_total) / max(1.0, float(target_total))
-        over_penalty = max(0, new_total - target_total) / max(1.0, float(target_total))
-
-        # train split gets a tiny stability bonus for very rare labels
-        rare_bonus = 0.0
-        if split == "train":
-            for raw_label in label_counts.keys():
-                label = int(raw_label)
-                if total_counts[label] <= 2:
-                    rare_bonus += 0.10
-
-        score = (
-            class_benefit
-            + rare_bonus
-            - balance_weight * balance_penalty
-            - over_weight * over_penalty
-        )
-
-        if best_score is None or score > best_score:
-            best_score = score
-            best_split = split
-
-    return best_split
-
-
-def greedy_group_stratified_split(df, label_col, group_col, ratios, seed):
-    rng = np.random.default_rng(seed)
-
-    total_rows = len(df)
-
-    split_targets = {
-        "train": int(round(total_rows * ratios["train"])),
-        "val": int(round(total_rows * ratios["val"])),
-        "test": total_rows - int(round(total_rows * ratios["train"])) - int(round(total_rows * ratios["val"])),
-    }
-
-    total_counts = Counter(df[label_col].astype(int).tolist())
-    class_targets = compute_class_targets(total_counts, ratios)
-
-    group_df = build_group_table(df, label_col=label_col, group_col=group_col)
-
-    group_df["rarity_score"] = group_df["label_counts"].apply(
-        lambda x: label_rarity_score(x, total_counts)
-    )
-
-    group_df["random_jitter"] = rng.random(len(group_df))
-
-    # Process rare and multi-label groups first.
-    group_df = group_df.sort_values(
-        by=["rarity_score", "num_unique_labels", "num_rows", "random_jitter"],
-        ascending=[False, False, False, True],
-    ).reset_index(drop=True)
-
-    split_counts = {
-        "train": 0,
-        "val": 0,
-        "test": 0,
-    }
-
-    split_class_counts = {
-        "train": defaultdict(int),
-        "val": defaultdict(int),
-        "test": defaultdict(int),
-    }
-
-    group_to_split = {}
-
-    for _, row in group_df.iterrows():
-        group_id = row["group_id"]
-        group_size = int(row["num_rows"])
-        label_counts = row["label_counts"]
-
-        chosen_split = choose_split_for_group(
-            label_counts=label_counts,
-            group_size=group_size,
-            split_counts=split_counts,
-            split_class_counts=split_class_counts,
-            split_targets=split_targets,
-            class_targets=class_targets,
-            total_counts=total_counts,
-            ratios=ratios,
-        )
-
-        group_to_split[group_id] = chosen_split
-        split_counts[chosen_split] += group_size
-
-        for label, count in label_counts.items():
-            split_class_counts[chosen_split][int(label)] += int(count)
-
-    out_df = df.copy()
-    out_df["clean_split"] = out_df[group_col].map(group_to_split)
-
-    return out_df, split_targets, class_targets
+    return group_records
 
 
 def summarize_split(df, label_col, split_col, group_col):
     rows = []
-
     all_labels = sorted(df[label_col].astype(int).unique().tolist())
 
     for split in ["train", "val", "test"]:
@@ -285,35 +122,31 @@ def summarize_split(df, label_col, split_col, group_col):
 
         label_counts = part[label_col].astype(int).value_counts().sort_index()
         labels_present = set(label_counts.index.astype(int).tolist())
+        missing = sorted(list(set(all_labels) - labels_present))
 
-        rows.append(
-            {
-                "split": split,
-                "rows": int(len(part)),
-                "groups": int(part[group_col].nunique()),
-                "labels_present": int(len(labels_present)),
-                "labels_missing": int(len(set(all_labels) - labels_present)),
-                "missing_labels": sorted(list(set(all_labels) - labels_present)),
-                "min_class_count": int(label_counts.min()) if len(label_counts) > 0 else 0,
-                "max_class_count": int(label_counts.max()) if len(label_counts) > 0 else 0,
-            }
-        )
+        rows.append({
+            "split": split,
+            "rows": int(len(part)),
+            "groups": int(part[group_col].nunique()),
+            "labels_present": int(len(labels_present)),
+            "labels_missing": int(len(missing)),
+            "missing_labels": missing,
+            "min_class_count": int(label_counts.min()) if len(label_counts) > 0 else 0,
+            "max_class_count": int(label_counts.max()) if len(label_counts) > 0 else 0,
+        })
 
     return pd.DataFrame(rows)
 
 
 def build_class_distribution(df, label_col, split_col):
     labels = sorted(df[label_col].astype(int).unique().tolist())
-
     rows = []
 
     for label in labels:
         row = {"pill_label": int(label)}
-
         for split in ["train", "val", "test"]:
-            count = int(((df[split_col] == split) & (df[label_col].astype(int) == label)).sum())
-            row[f"{split}_count"] = count
-
+            cnt = int(((df[split_col] == split) & (df[label_col].astype(int) == label)).sum())
+            row[f"{split}_count"] = cnt
         row["total"] = row["train_count"] + row["val_count"] + row["test_count"]
         rows.append(row)
 
@@ -325,26 +158,174 @@ def check_group_leakage(df, group_col, split_col):
 
     for group_id, g in df.groupby(group_col):
         splits = sorted(g[split_col].dropna().unique().tolist())
-
         if len(splits) > 1:
-            bad_groups.append(
-                {
-                    "group_id": group_id,
-                    "splits": ",".join(splits),
-                    "rows": len(g),
-                }
+            bad_groups.append({
+                "group_id": group_id,
+                "splits": ",".join(splits),
+                "rows": len(g),
+            })
+
+    # Keep header even if empty
+    return pd.DataFrame(bad_groups, columns=["group_id", "splits", "rows"])
+
+
+def create_clean_split(df, label_col, group_col, ratios, seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+
+    total_counts = Counter(df[label_col].astype(int).tolist())
+    class_targets = build_class_targets(total_counts, ratios)
+
+    group_records = build_group_records(
+        df=df,
+        label_col=label_col,
+        group_col=group_col,
+        total_counts=total_counts,
+        seed=seed,
+    )
+
+    group_records = sorted(
+        group_records,
+        key=lambda x: (-x["rarity_score"], -x["num_unique_labels"], x["num_rows"], x["rand"])
+    )
+
+    total_rows = len(df)
+    row_targets = {
+        "train": int(round(total_rows * ratios["train"])),
+        "val": int(round(total_rows * ratios["val"])),
+        "test": total_rows - int(round(total_rows * ratios["train"])) - int(round(total_rows * ratios["val"])),
+    }
+
+    assigned_group_to_split = {}
+    split_rows = {"train": 0, "val": 0, "test": 0}
+    split_class_counts = {
+        "train": defaultdict(int),
+        "val": defaultdict(int),
+        "test": defaultdict(int),
+    }
+
+    label_to_groups = defaultdict(list)
+    for rec in group_records:
+        for lb in rec["labels"]:
+            label_to_groups[lb].append(rec)
+
+    def assign_group(rec, split):
+        gid = rec["group_id"]
+        if gid in assigned_group_to_split:
+            return
+
+        assigned_group_to_split[gid] = split
+        split_rows[split] += rec["num_rows"]
+
+        for lb, cnt in rec["label_counts"].items():
+            split_class_counts[split][int(lb)] += int(cnt)
+
+    # ------------------------------------------------------------------
+    # Phase A: Force train to cover all classes if possible
+    # ------------------------------------------------------------------
+    labels_by_rarity = sorted(total_counts.keys(), key=lambda lb: (total_counts[lb], lb))
+
+    for lb in labels_by_rarity:
+        if split_class_counts["train"][lb] > 0:
+            continue
+
+        candidates = [rec for rec in label_to_groups[lb] if rec["group_id"] not in assigned_group_to_split]
+        if not candidates:
+            continue
+
+        def anchor_train_score(rec):
+            uncovered_bonus = 0.0
+            for x in rec["labels"]:
+                if split_class_counts["train"][x] == 0:
+                    uncovered_bonus += 1.0 / np.sqrt(max(1.0, float(total_counts[x])))
+
+            size_penalty = 0.002 * rec["num_rows"]
+            over_penalty = max(
+                0.0,
+                (split_rows["train"] + rec["num_rows"] - row_targets["train"]) / max(1.0, row_targets["train"])
             )
+            return uncovered_bonus - size_penalty - 0.50 * over_penalty
 
-    return pd.DataFrame(bad_groups)
+        best_rec = max(candidates, key=anchor_train_score)
+        assign_group(best_rec, "train")
+
+    # ------------------------------------------------------------------
+    # Phase B: Greedy assign remaining groups
+    # ------------------------------------------------------------------
+    remaining_groups = [rec for rec in group_records if rec["group_id"] not in assigned_group_to_split]
+
+    def score_group_for_split(rec, split):
+        size = rec["num_rows"]
+        new_rows = split_rows[split] + size
+        target_rows = row_targets[split]
+
+        # Reward useful class coverage according to soft class targets
+        class_gain = 0.0
+        for lb, cnt in rec["label_counts"].items():
+            current = split_class_counts[split][lb]
+            target = class_targets[split].get(lb, 0)
+            need = max(0, target - current)
+            useful = min(cnt, need)
+            rarity = 1.0 / np.sqrt(max(1.0, float(total_counts[lb])))
+
+            class_gain += useful * rarity
+
+            if current == 0 and target > 0:
+                class_gain += 0.20 * rarity
+
+        # Strong preference to keep train row count healthy but not too oversized
+        balance_penalty = abs(new_rows - target_rows) / max(1.0, float(target_rows))
+        over_penalty = max(0.0, new_rows - target_rows) / max(1.0, float(target_rows))
+
+        # Tiny stability bonus to train for very rare labels
+        train_rare_bonus = 0.0
+        if split == "train":
+            for lb in rec["labels"]:
+                if total_counts[lb] <= 2:
+                    train_rare_bonus += 0.08
+
+        score = (
+            class_gain
+            + train_rare_bonus
+            - 0.35 * balance_penalty
+            - 1.20 * over_penalty
+        )
+
+        return score
+
+    for rec in remaining_groups:
+        best_split = None
+        best_score = None
+
+        for split in ["train", "val", "test"]:
+            sc = score_group_for_split(rec, split)
+            if best_score is None or sc > best_score:
+                best_score = sc
+                best_split = split
+
+        assign_group(rec, best_split)
+
+    # ------------------------------------------------------------------
+    # Build final dataframe
+    # ------------------------------------------------------------------
+    out_df = df.copy()
+    out_df["clean_split"] = out_df[group_col].map(assigned_group_to_split)
+
+    if out_df["clean_split"].isna().any():
+        raise RuntimeError("Some groups were not assigned to a split.")
+
+    return out_df, row_targets, class_targets
 
 
-def save_outputs(df, output_dir, label_col, group_col, split_col, split_targets, class_targets, args):
+def save_outputs(df, output_dir, label_col, group_col):
     output_dir = Path(output_dir)
     ensure_dir(output_dir)
 
-    train_df = df[df[split_col] == "train"].drop(columns=[split_col], errors="ignore").copy()
-    val_df = df[df[split_col] == "val"].drop(columns=[split_col], errors="ignore").copy()
-    test_df = df[df[split_col] == "test"].drop(columns=[split_col], errors="ignore").copy()
+    split_col = "clean_split"
+
+    train_df = df[df[split_col] == "train"].copy()
+    val_df = df[df[split_col] == "val"].copy()
+    test_df = df[df[split_col] == "test"].copy()
 
     train_df["split"] = "train"
     val_df["split"] = "val"
@@ -370,30 +351,8 @@ def save_outputs(df, output_dir, label_col, group_col, split_col, split_targets,
     leakage_path = output_dir / "group_leakage_check.csv"
     leakage_df.to_csv(leakage_path, index=False)
 
-    full_metadata_path = output_dir / "full_metadata_with_clean_split.csv"
-    df.to_csv(full_metadata_path, index=False)
-
-    config = {
-        "old_train_csv": args.old_train_csv,
-        "old_val_csv": args.old_val_csv,
-        "old_test_csv": args.old_test_csv,
-        "output_dir": str(output_dir),
-        "label_col": label_col,
-        "group_col": group_col,
-        "split_col": split_col,
-        "split_ratios": args.split_ratios,
-        "seed": args.seed,
-        "drop_duplicate_pill_crop_path": args.drop_duplicate_pill_crop_path,
-        "split_targets": split_targets,
-        "class_targets_note": "Per-class targets were used only as soft targets due to group-level splitting.",
-        "num_rows_total": int(len(df)),
-        "num_groups_total": int(df[group_col].nunique()),
-    }
-
-    config_path = output_dir / "split_config.json"
-
-    with open(config_path, "w", encoding="utf-8") as f:
-        json.dump(config, f, ensure_ascii=False, indent=2)
+    full_meta_path = output_dir / "full_metadata_with_clean_split.csv"
+    df.to_csv(full_meta_path, index=False)
 
     print("\nSaved files:")
     print("Train clean :", train_path)
@@ -402,35 +361,23 @@ def save_outputs(df, output_dir, label_col, group_col, split_col, split_targets,
     print("Summary     :", summary_path)
     print("Class dist  :", class_dist_path)
     print("Leakage chk :", leakage_path)
-    print("Full metadata:", full_metadata_path)
-    print("Config      :", config_path)
-
-    return {
-        "train_path": train_path,
-        "val_path": val_path,
-        "test_path": test_path,
-        "summary_path": summary_path,
-        "class_dist_path": class_dist_path,
-        "leakage_path": leakage_path,
-        "config_path": config_path,
-    }
+    print("Full meta   :", full_meta_path)
 
 
 def main(args):
-    output_dir = Path(args.output_dir)
-    ensure_dir(output_dir)
-
     ratios = parse_ratio_text(args.split_ratios)
+    ensure_dir(args.output_dir)
 
-    print("=== CREATE CLEAN PAPER-LIKE SPLIT ===")
+    print("=== CREATE CLEAN PAPER-LIKE SPLIT V2 ===")
     print("Old train CSV:", args.old_train_csv)
     print("Old val CSV  :", args.old_val_csv)
     print("Old test CSV :", args.old_test_csv)
-    print("Output dir   :", output_dir)
+    print("Output dir   :", args.output_dir)
     print("Ratios       :", ratios)
     print("Label col    :", args.label_col)
     print("Group col    :", args.group_col)
     print("Seed         :", args.seed)
+    print("Drop duplicate pill_crop_path:", args.drop_duplicate_pill_crop_path)
 
     train_df = read_csv_with_source(args.old_train_csv, "old_train")
     val_df = read_csv_with_source(args.old_val_csv, "old_val")
@@ -438,72 +385,53 @@ def main(args):
 
     full_df = pd.concat([train_df, val_df, test_df], ignore_index=True)
 
-    print("\nBefore duplicate handling:")
-    print("Total rows:", len(full_df))
-    print("Columns:", full_df.columns.tolist())
-
     if args.label_col not in full_df.columns:
-        raise ValueError(f"label_col '{args.label_col}' not found in metadata.")
+        raise ValueError(f"label_col '{args.label_col}' not found in dataframe.")
 
     full_df[args.label_col] = full_df[args.label_col].astype(int)
 
+    if args.group_col not in full_df.columns:
+        print(f"Warning: group_col '{args.group_col}' not found. Fallback to row-level groups.")
+        full_df[args.group_col] = [f"row_{i}" for i in range(len(full_df))]
+
+    print("\nBefore duplicate handling:")
+    print("Total rows:", len(full_df))
+    print("Total groups:", full_df[args.group_col].nunique())
+    print("Total labels:", full_df[args.label_col].nunique())
+
     if args.drop_duplicate_pill_crop_path:
-        if "pill_crop_path" in full_df.columns:
-            before = len(full_df)
-            full_df = full_df.drop_duplicates(subset=["pill_crop_path"]).reset_index(drop=True)
-            after = len(full_df)
-            print(f"\nDropped duplicate pill_crop_path rows: {before - after}")
-        else:
-            print("\nWarning: pill_crop_path column not found. Cannot drop duplicates by pill_crop_path.")
-
-    full_df = full_df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
-
-    internal_group_col = "__clean_group_id__"
-    full_df[internal_group_col] = make_group_id(full_df, args.group_col)
+        if "pill_crop_path" not in full_df.columns:
+            raise ValueError("pill_crop_path not found but --drop_duplicate_pill_crop_path was used.")
+        before = len(full_df)
+        full_df = full_df.drop_duplicates(subset=["pill_crop_path"]).reset_index(drop=True)
+        print(f"Dropped duplicate rows by pill_crop_path: {before - len(full_df)}")
 
     print("\nAfter duplicate handling:")
     print("Total rows:", len(full_df))
-    print("Total groups:", full_df[internal_group_col].nunique())
+    print("Total groups:", full_df[args.group_col].nunique())
     print("Total labels:", full_df[args.label_col].nunique())
 
-    print("\nOriginal source split counts:")
-    print(full_df["source_split"].value_counts())
-
-    print("\nOriginal label distribution top 20:")
-    print(full_df[args.label_col].value_counts().head(20))
-
-    clean_df, split_targets, class_targets = greedy_group_stratified_split(
+    out_df, row_targets, class_targets = create_clean_split(
         df=full_df,
         label_col=args.label_col,
-        group_col=internal_group_col,
+        group_col=args.group_col,
         ratios=ratios,
         seed=args.seed,
     )
 
-    clean_df = clean_df.rename(columns={"clean_split": "__clean_split__"})
-
     print("\n=== CLEAN SPLIT SUMMARY ===")
     summary_df = summarize_split(
-        clean_df,
+        out_df,
         label_col=args.label_col,
-        split_col="__clean_split__",
-        group_col=internal_group_col,
+        split_col="clean_split",
+        group_col=args.group_col,
     )
-
     print(summary_df.to_string(index=False))
 
-    leakage_df = check_group_leakage(
-        clean_df,
-        group_col=internal_group_col,
-        split_col="__clean_split__",
-    )
-
-    print("\nGroup leakage rows:", len(leakage_df))
-
     class_dist_df = build_class_distribution(
-        clean_df,
+        out_df,
         label_col=args.label_col,
-        split_col="__clean_split__",
+        split_col="clean_split",
     )
 
     print("\nRare classes after clean split:")
@@ -512,27 +440,44 @@ def main(args):
     print("\nMost frequent classes after clean split:")
     print(class_dist_df.sort_values("total", ascending=False).head(20).to_string(index=False))
 
-    # Remove internal group column before saving split CSVs if user does not want it.
-    if args.keep_internal_group_col:
-        save_df = clean_df.copy()
-    else:
-        save_df = clean_df.drop(columns=[internal_group_col], errors="ignore").copy()
+    leakage_df = check_group_leakage(
+        out_df,
+        group_col=args.group_col,
+        split_col="clean_split",
+    )
+    print("\nGroup leakage rows:", len(leakage_df))
+
+    config = {
+        "old_train_csv": args.old_train_csv,
+        "old_val_csv": args.old_val_csv,
+        "old_test_csv": args.old_test_csv,
+        "output_dir": args.output_dir,
+        "label_col": args.label_col,
+        "group_col": args.group_col,
+        "split_ratios": args.split_ratios,
+        "seed": args.seed,
+        "drop_duplicate_pill_crop_path": args.drop_duplicate_pill_crop_path,
+        "row_targets": row_targets,
+        "note": "Train coverage is anchored first so train should include all classes that are coverable under group constraints.",
+    }
+
+    config_path = Path(args.output_dir) / "split_config.json"
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
 
     save_outputs(
-        df=save_df,
-        output_dir=output_dir,
+        df=out_df,
+        output_dir=args.output_dir,
         label_col=args.label_col,
-        group_col=args.group_col if args.group_col in save_df.columns else "prescription_key",
-        split_col="__clean_split__",
-        split_targets=split_targets,
-        class_targets=class_targets,
-        args=args,
+        group_col=args.group_col,
     )
+
+    print("Config      :", config_path)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Create a clean paper-like group-aware stratified split for VAIPE Best PIKA metadata."
+        description="Create clean paper-like split v2 with full train coverage and group-aware splitting."
     )
 
     parser.add_argument(
@@ -540,32 +485,26 @@ if __name__ == "__main__":
         type=str,
         default="/content/drive/MyDrive/vaipe_splits/best_pika_split_metadata/train.csv",
     )
-
     parser.add_argument(
         "--old_val_csv",
         type=str,
         default="/content/drive/MyDrive/vaipe_splits/best_pika_split_metadata/val.csv",
     )
-
     parser.add_argument(
         "--old_test_csv",
         type=str,
         default="/content/drive/MyDrive/vaipe_splits/best_pika_split_metadata/test.csv",
     )
-
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/content/drive/MyDrive/vaipe_splits/clean_paper_like_split_v1",
+        default="/content/drive/MyDrive/vaipe_splits/clean_paper_like_split_v2",
     )
-
     parser.add_argument(
         "--split_ratios",
         type=str,
         default="0.70,0.15,0.15",
-        help="Train,val,test ratios. Default is 70/15/15.",
     )
-
     parser.add_argument("--label_col", type=str, default="pill_label")
     parser.add_argument("--group_col", type=str, default="prescription_key")
     parser.add_argument("--seed", type=int, default=42)
@@ -573,13 +512,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--drop_duplicate_pill_crop_path",
         action="store_true",
-        help="Drop duplicate rows by pill_crop_path before splitting.",
-    )
-
-    parser.add_argument(
-        "--keep_internal_group_col",
-        action="store_true",
-        help="Keep internal group id column in saved CSVs.",
+        help="Optional. Default is OFF.",
     )
 
     args = parser.parse_args()

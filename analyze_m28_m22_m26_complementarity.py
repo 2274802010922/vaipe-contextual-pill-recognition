@@ -1,23 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-M28 - Error-driven calibrated soft ensemble for VAIPE contextual pill recognition.
-
-Purpose:
-1) Compare M22 and M26 complementarity on validation/test.
-2) Search safe ensemble configs on validation only.
-3) Apply the selected config to test.
-
-This script does NOT train a new deep model. It consumes prediction CSV + probability .npy files
-from M22 and M26 and creates M28 ensemble outputs.
-
-Example:
-python analyze_m28_m22_m26_complementarity.py \
-  --m22_dir /content/drive/MyDrive/model/M22_selective_ensemble/ensemble_run_v1 \
-  --m26_dir /content/drive/MyDrive/model/M26_calibrated_context_ensemble/run_v1 \
-  --output_dir /content/drive/MyDrive/model/M28_error_driven_soft_ensemble/run_v1 \
-  --num_classes 108
-"""
 
 import argparse
 import glob

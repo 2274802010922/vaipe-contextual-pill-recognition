@@ -1,3 +1,17 @@
+"""
+Audit clean paper-like split for PIKA protocol / paper-compatible benchmarks.
+
+Typical Colab run (after Drive mount + repo clone):
+  python audit_pika_paper_protocol.py \\
+    --train_csv /content/drive/MyDrive/vaipe_splits/clean_paper_like_split_v2/train_clean.csv \\
+    --val_csv   /content/drive/MyDrive/vaipe_splits/clean_paper_like_split_v2/val_clean.csv \\
+    --test_csv  /content/drive/MyDrive/vaipe_splits/clean_paper_like_split_v2/test_clean.csv \\
+    --output_dir /content/drive/MyDrive/model/audit_pika_protocol_v1
+
+Outputs: audit_report.md, audit_candidate_benchmarks.csv (for evaluate_candidate_benchmarks.py),
+leakage CSVs, class distribution.
+"""
+
 import argparse
 import json
 from pathlib import Path

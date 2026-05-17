@@ -145,6 +145,7 @@ def main(args):
 
     print("=== EVALUATE CANDIDATE BENCHMARKS ===")
     print("Candidate file:", args.candidates_csv)
+    print("M17 predictions:", args.m17_predictions)
     print("M19 predictions:", args.m19_predictions)
     print("M22 predictions:", args.m22_predictions)
     print("Output dir:", output_dir)
@@ -152,6 +153,14 @@ def main(args):
     candidates_df = pd.read_csv(args.candidates_csv)
 
     all_results = []
+
+    if args.m17_predictions:
+        m17_df = evaluate_model_on_candidates(
+            pred_path=args.m17_predictions,
+            candidates_df=candidates_df,
+            model_name="M17",
+        )
+        all_results.append(m17_df)
 
     if args.m19_predictions:
         m19_df = evaluate_model_on_candidates(
@@ -209,6 +218,7 @@ def main(args):
 
     summary = {
         "candidates_csv": args.candidates_csv,
+        "m17_predictions": args.m17_predictions,
         "m19_predictions": args.m19_predictions,
         "m22_predictions": args.m22_predictions,
         "output_csv": str(out_csv),
@@ -224,6 +234,7 @@ if __name__ == "__main__":
     )
 
     parser.add_argument("--candidates_csv", type=str, required=True)
+    parser.add_argument("--m17_predictions", type=str, default="")
     parser.add_argument("--m19_predictions", type=str, default="")
     parser.add_argument("--m22_predictions", type=str, default="")
     parser.add_argument("--output_dir", type=str, required=True)

@@ -1,8 +1,30 @@
+"""
+Train M17 faithful PIKA model on clean paper-like split.
+
+Paper-faithful comparison track (ResNet-50 pill encoder, per PIKA paper):
+  python train_m17_faithful_pika.py \\
+    --comparison_track paper_faithful \\
+    --train_csv .../train_clean.csv --val_csv .../val_clean.csv --test_csv .../test_clean.csv \\
+    --graph_artifacts_dir .../graph_artifacts --output_dir .../train_run_resnet50
+
+Or explicitly:
+  --pill_backbone_preset resnet50
+  --pill_model_name resnet50.a1_in1k
+"""
+
 import os
 import json
 import argparse
 from pathlib import Path
 from collections import Counter
+
+# timm names aligned with PIKA paper-style ResNet-50 visual encoder
+PILL_BACKBONE_PRESETS = {
+    "resnet50": "resnet50.a1_in1k",
+    "efficientnetv2_s": "tf_efficientnetv2_s.in21k_ft_in1k",
+}
+DEFAULT_PILL_MODEL = PILL_BACKBONE_PRESETS["efficientnetv2_s"]
+PAPER_FAITHFUL_PILL_MODEL = PILL_BACKBONE_PRESETS["resnet50"]
 
 import numpy as np
 import pandas as pd
@@ -414,13 +436,36 @@ def prepare_dataframe(csv_path, label_to_idx, split_name):
     return df
 
 
+def resolve_pill_model_name(args):
+    """Preset / paper track override; explicit --pill_model_name wins if non-default."""
+    explicit = getattr(args, "_pill_model_explicit", False)
+    if explicit:
+        return args.pill_model_name
+
+    if args.pill_backbone_preset:
+        preset = args.pill_backbone_preset.strip().lower()
+        if preset not in PILL_BACKBONE_PRESETS:
+            raise ValueError(
+                f"Unknown pill_backbone_preset '{preset}'. "
+                f"Choose from: {list(PILL_BACKBONE_PRESETS.keys())}"
+            )
+        return PILL_BACKBONE_PRESETS[preset]
+
+    if args.comparison_track == "paper_faithful":
+        return PAPER_FAITHFUL_PILL_MODEL
+
+    return args.pill_model_name
+
+
 def main(args):
+    args.pill_model_name = resolve_pill_model_name(args)
     seed_everything(args.seed)
     ensure_dir(args.output_dir)
 
     device = get_device()
 
     print("=== M17 FAITHFUL PIKA TRAINING ===")
+    print("Comparison track:", args.comparison_track)
     print("Using device:", device)
     print("Train CSV:", args.train_csv)
     print("Val CSV  :", args.val_csv)
@@ -584,6 +629,8 @@ def main(args):
         "num_classes": num_classes,
         "graph_dim": graph_dim,
         "pill_model_name": args.pill_model_name,
+        "comparison_track": args.comparison_track,
+        "pill_backbone_preset": args.pill_backbone_preset,
         "pres_model_name": args.pres_model_name,
         "hidden_dim": args.hidden_dim,
         "max_context_len": args.max_context_len,
@@ -735,7 +782,26 @@ if __name__ == "__main__":
         default="M17_faithful_pika_last.pth",
     )
 
-    parser.add_argument("--pill_model_name", type=str, default="tf_efficientnetv2_s.in21k_ft_in1k")
+    parser.add_argument(
+        "--comparison_track",
+        type=str,
+        default="default",
+        choices=["default", "paper_faithful"],
+        help="paper_faithful selects ResNet-50 pill encoder (PIKA paper-style comparison).",
+    )
+    parser.add_argument(
+        "--pill_backbone_preset",
+        type=str,
+        default="",
+        choices=["", "resnet50", "efficientnetv2_s"],
+        help="Shortcut for --pill_model_name. Ignored if --pill_model_name is passed explicitly.",
+    )
+    parser.add_argument(
+        "--pill_model_name",
+        type=str,
+        default=DEFAULT_PILL_MODEL,
+        help=f"Explicit timm pill encoder. Default: {DEFAULT_PILL_MODEL}",
+    )
     parser.add_argument("--pres_model_name", type=str, default="resnet18.a1_in1k")
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--max_context_len", type=int, default=5)
@@ -766,5 +832,12 @@ if __name__ == "__main__":
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
 
+    import sys
+
     args = parser.parse_args()
+    args._pill_model_explicit = any(
+        a == "--pill_model_name" or a.startswith("--pill_model_name=")
+        for a in sys.argv[1:]
+    )
+
     main(args)

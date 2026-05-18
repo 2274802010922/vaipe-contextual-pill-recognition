@@ -1,5 +1,25 @@
+"""
+M23 Stage 1 v2: visual-only pill crop pretraining.
+
+Use --pill_backbone shortcut for common backbones (overrides --backbone_name
+unless --backbone_name was passed explicitly on the command line):
+  resnet50           -> resnet50.a1_in1k    (PIKA-paper visual encoder)
+  efficientnetv2_s   -> tf_efficientnetv2_s.in21k_ft_in1k
+  convnext_tiny      -> convnext_tiny.in12k_ft_in1k (default)
+
+Phase 2 / Run D usage (pretrained ResNet-50 visual init for M17):
+  python train_m23_stage1_visual_classifier_v2.py \\
+    --pill_backbone resnet50 \\
+    --train_csv .../train_clean.csv --val_csv .../val_clean.csv --test_csv .../test_clean.csv \\
+    --graph_artifacts_dir .../graph_artifacts \\
+    --output_dir .../visual_init_resnet50 \\
+    --best_name visual_init_resnet50_best.pth \\
+    --last_name visual_init_resnet50_last.pth
+"""
+
 import argparse
 import json
+import sys
 from pathlib import Path
 from collections import Counter
 
@@ -19,6 +39,13 @@ from train_best_pika_model import (
     add_mapped_columns,
     build_transforms,
 )
+
+
+PILL_BACKBONE_PRESETS = {
+    "resnet50": "resnet50.a1_in1k",
+    "efficientnetv2_s": "tf_efficientnetv2_s.in21k_ft_in1k",
+    "convnext_tiny": "convnext_tiny.in12k_ft_in1k",
+}
 
 from train_m23_stage1_visual_classifier import (
     load_json,
@@ -172,6 +199,31 @@ def validate_one_epoch(model, loader, criterion, device, num_classes):
         "preds": all_preds,
         "confidence": all_conf,
     }
+
+
+def resolve_backbone_name(args, explicit_args):
+    """If --pill_backbone is given and --backbone_name was NOT explicit,
+    map shortcut -> timm name. Otherwise keep args.backbone_name."""
+    preset = (args.pill_backbone or "").strip().lower()
+    if not preset:
+        return args.backbone_name
+
+    if preset not in PILL_BACKBONE_PRESETS:
+        raise ValueError(
+            f"Unknown --pill_backbone preset '{preset}'. "
+            f"Choose from: {list(PILL_BACKBONE_PRESETS.keys())}"
+        )
+
+    if "backbone_name" in explicit_args:
+        print(
+            f"--backbone_name was passed explicitly ({args.backbone_name}); "
+            f"ignoring --pill_backbone={preset}."
+        )
+        return args.backbone_name
+
+    mapped = PILL_BACKBONE_PRESETS[preset]
+    print(f"Resolved --pill_backbone={preset} -> backbone_name={mapped}")
+    return mapped
 
 
 def main(args):
@@ -465,6 +517,16 @@ if __name__ == "__main__":
     parser.add_argument("--last_name", type=str, default="M23_stage1_v2_visual_last.pth")
 
     parser.add_argument("--backbone_name", type=str, default="convnext_tiny.in12k_ft_in1k")
+    parser.add_argument(
+        "--pill_backbone",
+        type=str,
+        default="",
+        choices=["", "resnet50", "efficientnetv2_s", "convnext_tiny"],
+        help=(
+            "Shortcut alias for --backbone_name. If --backbone_name is passed "
+            "explicitly, this is ignored."
+        ),
+    )
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--dropout_p", type=float, default=0.55)
     parser.add_argument("--image_size", type=int, default=224)
@@ -488,4 +550,13 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
+
+    explicit_args = set()
+    for a in sys.argv[1:]:
+        if a.startswith("--"):
+            name = a[2:].split("=", 1)[0]
+            explicit_args.add(name)
+
+    args.backbone_name = resolve_backbone_name(args, explicit_args)
+
     main(args)

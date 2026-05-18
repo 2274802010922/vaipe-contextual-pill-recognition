@@ -7,3 +7,4 @@ scikit-learn
 matplotlib
 Pillow
 tqdm
+gensim

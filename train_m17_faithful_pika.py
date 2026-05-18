@@ -10,6 +10,19 @@ Paper-faithful comparison track (ResNet-50 pill encoder, per PIKA paper):
 Or explicitly:
   --pill_backbone_preset resnet50
   --pill_model_name resnet50.a1_in1k
+
+paper_faithful_v2 preset (Phase 2 default for ResNet-50 schedule):
+  --comparison_track paper_faithful_v2
+  Overrides: epochs=25, lr=5e-4, patience=8, batch_size=16,
+             class_weight_exponent=0.35, label_smoothing=0.02,
+             pseudo_loss_weight=0.30, link_loss_weight=0.10, dropout_p=0.45.
+  User-explicit args are preserved.
+
+Optional visual stage1 init (Run D, Phase 2):
+  --visual_init_ckpt /path/to/M23_stage1_v2_visual_best.pth
+  Loads compatible pill encoder weights from an M23 stage1 visual
+  classifier checkpoint (key 'encoder_state_dict') into model.pill_encoder.
+  Mismatched / extra keys (final FC, classifier head, ...) are ignored.
 """
 
 import os
@@ -436,6 +449,100 @@ def prepare_dataframe(csv_path, label_to_idx, split_name):
     return df
 
 
+def _safe_torch_load(path, device="cpu"):
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def load_visual_init_into_pill_encoder(model, visual_init_ckpt_path):
+    """Copy compatible weights from an M23 stage1 visual classifier checkpoint
+    into model.pill_encoder. Returns (loaded_count, total_target, source_key).
+
+    Strategy:
+      1. Prefer checkpoint["encoder_state_dict"] (timm backbone state_dict).
+      2. Else strip a known prefix from checkpoint["model_state_dict"]:
+         "pill_encoder." or "encoder.".
+      3. load_state_dict(strict=False) so unrelated keys (neck / classifier
+         / final FC) are silently ignored.
+    """
+    ckpt_path = Path(visual_init_ckpt_path)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"--visual_init_ckpt not found: {ckpt_path}")
+
+    print(f"Loading visual init checkpoint: {ckpt_path}")
+    ckpt = _safe_torch_load(str(ckpt_path), device="cpu")
+
+    candidate_state = None
+    source_key = ""
+
+    if isinstance(ckpt, dict):
+        if "encoder_state_dict" in ckpt and isinstance(ckpt["encoder_state_dict"], dict):
+            candidate_state = ckpt["encoder_state_dict"]
+            source_key = "encoder_state_dict"
+        elif "model_state_dict" in ckpt and isinstance(ckpt["model_state_dict"], dict):
+            full_state = ckpt["model_state_dict"]
+            for prefix in ("pill_encoder.", "encoder."):
+                stripped = {
+                    k[len(prefix):]: v for k, v in full_state.items() if k.startswith(prefix)
+                }
+                if len(stripped) > 0:
+                    candidate_state = stripped
+                    source_key = f"model_state_dict[{prefix}*]"
+                    break
+        elif "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+            full_state = ckpt["state_dict"]
+            for prefix in ("pill_encoder.", "encoder."):
+                stripped = {
+                    k[len(prefix):]: v for k, v in full_state.items() if k.startswith(prefix)
+                }
+                if len(stripped) > 0:
+                    candidate_state = stripped
+                    source_key = f"state_dict[{prefix}*]"
+                    break
+
+    if candidate_state is None and isinstance(ckpt, dict):
+        if all(isinstance(v, torch.Tensor) for v in ckpt.values()):
+            candidate_state = ckpt
+            source_key = "raw_state_dict"
+
+    if candidate_state is None:
+        raise ValueError(
+            "Could not find a usable encoder state dict in visual_init_ckpt. "
+            "Expected keys: encoder_state_dict / model_state_dict (with pill_encoder.* "
+            "or encoder.* prefix) / raw state_dict."
+        )
+
+    target_state = model.pill_encoder.state_dict()
+    total_target = len(target_state)
+
+    compatible = {}
+    skipped_shape = []
+    for k, v in candidate_state.items():
+        if k in target_state and target_state[k].shape == v.shape:
+            compatible[k] = v
+        elif k in target_state:
+            skipped_shape.append((k, tuple(target_state[k].shape), tuple(v.shape)))
+
+    missing, unexpected = model.pill_encoder.load_state_dict(compatible, strict=False)
+
+    print(f"Loaded visual init from {ckpt_path}")
+    print(f"  source key       : {source_key}")
+    print(f"  source keys      : {len(candidate_state)}")
+    print(f"  pill_encoder keys: {total_target}")
+    print(f"  copied keys      : {len(compatible)} / {total_target}")
+    print(f"  missing in src   : {len(missing)}")
+    print(f"  unexpected (drop): {len(unexpected)}")
+
+    if skipped_shape:
+        print(f"  shape-mismatch skipped: {len(skipped_shape)} (showing up to 5)")
+        for name, t_shape, s_shape in skipped_shape[:5]:
+            print(f"    - {name}: target={t_shape} src={s_shape}")
+
+    return len(compatible), total_target, source_key
+
+
 def resolve_pill_model_name(args):
     """Preset / paper track override; explicit --pill_model_name wins if non-default."""
     explicit = getattr(args, "_pill_model_explicit", False)
@@ -625,6 +732,24 @@ def main(args):
     print("Hidden dim        :", args.hidden_dim)
     print("Train graph embeddings:", args.train_graph_embeddings)
 
+    visual_init_info = {
+        "visual_init_ckpt": "",
+        "visual_init_source_key": "",
+        "visual_init_loaded_keys": 0,
+        "visual_init_target_keys": 0,
+    }
+    if args.visual_init_ckpt:
+        loaded, total, src_key = load_visual_init_into_pill_encoder(
+            model=model,
+            visual_init_ckpt_path=args.visual_init_ckpt,
+        )
+        visual_init_info = {
+            "visual_init_ckpt": str(args.visual_init_ckpt),
+            "visual_init_source_key": src_key,
+            "visual_init_loaded_keys": int(loaded),
+            "visual_init_target_keys": int(total),
+        }
+
     class_weights = build_class_weights(
         train_df=train_df,
         num_classes=num_classes,
@@ -680,6 +805,7 @@ def main(args):
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "note": "Graph embeddings were built from train split only.",
+        **visual_init_info,
     }
 
     save_json(config, os.path.join(args.output_dir, "m17_train_config.json"))
@@ -871,6 +997,18 @@ if __name__ == "__main__":
 
     parser.add_argument("--train_graph_embeddings", action="store_true")
     parser.add_argument("--clip_grad_norm", type=float, default=1.0)
+
+    parser.add_argument(
+        "--visual_init_ckpt",
+        type=str,
+        default="",
+        help=(
+            "Optional path to an M23 stage1 visual classifier checkpoint "
+            "(e.g. M23_stage1_v2_visual_best.pth). If set, compatible weights "
+            "are copied into model.pill_encoder before training. "
+            "Run D (Phase 2) of the paper-faithful comparison track."
+        ),
+    )
 
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)

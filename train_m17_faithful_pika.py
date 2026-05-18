@@ -451,10 +451,49 @@ def resolve_pill_model_name(args):
             )
         return PILL_BACKBONE_PRESETS[preset]
 
-    if args.comparison_track == "paper_faithful":
+    if args.comparison_track in ("paper_faithful", "paper_faithful_v2"):
         return PAPER_FAITHFUL_PILL_MODEL
 
     return args.pill_model_name
+
+
+# paper_faithful_v2: ResNet-50 + longer schedule + higher LR to fix the
+# undertraining observed in paper_faithful Phase 1 (val 0.313 / test 0.322 @ 15 epoch, lr=1e-4).
+PAPER_FAITHFUL_V2_OVERRIDES = {
+    "epochs": 25,
+    "lr": 5e-4,
+    "patience": 8,
+    "batch_size": 16,
+    "class_weight_exponent": 0.35,
+    "label_smoothing": 0.02,
+    "pseudo_loss_weight": 0.30,
+    "link_loss_weight": 0.10,
+    "dropout_p": 0.45,
+}
+
+
+def apply_comparison_track_overrides(args, explicit_args):
+    """Apply per-track defaults, but never clobber values the user passed explicitly."""
+    if args.comparison_track != "paper_faithful_v2":
+        return
+
+    applied = {}
+    skipped = {}
+
+    for key, value in PAPER_FAITHFUL_V2_OVERRIDES.items():
+        if key in explicit_args:
+            skipped[key] = getattr(args, key)
+            continue
+        setattr(args, key, value)
+        applied[key] = value
+
+    print("=== paper_faithful_v2 overrides ===")
+    if applied:
+        for key, value in applied.items():
+            print(f"  set    {key:25s} -> {value}")
+    if skipped:
+        for key, value in skipped.items():
+            print(f"  kept   {key:25s} -> {value} (user explicit)")
 
 
 def main(args):
@@ -786,8 +825,12 @@ if __name__ == "__main__":
         "--comparison_track",
         type=str,
         default="default",
-        choices=["default", "paper_faithful"],
-        help="paper_faithful selects ResNet-50 pill encoder (PIKA paper-style comparison).",
+        choices=["default", "paper_faithful", "paper_faithful_v2"],
+        help=(
+            "paper_faithful: ResNet-50 pill encoder, base PIKA paper-style schedule. "
+            "paper_faithful_v2: ResNet-50 + longer schedule (25 epoch, lr=5e-4, patience=8) "
+            "to fix undertraining seen in Phase 1."
+        ),
     )
     parser.add_argument(
         "--pill_backbone_preset",
@@ -839,5 +882,13 @@ if __name__ == "__main__":
         a == "--pill_model_name" or a.startswith("--pill_model_name=")
         for a in sys.argv[1:]
     )
+
+    explicit_args = set()
+    for a in sys.argv[1:]:
+        if a.startswith("--"):
+            name = a[2:].split("=", 1)[0]
+            explicit_args.add(name)
+
+    apply_comparison_track_overrides(args, explicit_args)
 
     main(args)
